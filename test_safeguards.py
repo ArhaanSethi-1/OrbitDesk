@@ -1,6 +1,8 @@
 import ast
 from pathlib import Path
 import unittest
+import tempfile
+from unittest.mock import patch
 
 import safeguards
 
@@ -27,6 +29,26 @@ class SafeguardPolicyTests(unittest.TestCase):
             with self.subTest(action=action):
                 decision, _ = safeguards.authorize(action, target=target)
                 self.assertEqual(decision, safeguards.Decision.BLOCK)
+
+    def test_desktop_actions_require_a_user_decision(self):
+        actions = (
+            "type_text", "prompt_external_ai", "launch_program", "system_control",
+            "volume_control", "run_approved_command", "navigate_website",
+            "move_file",
+        )
+        with patch.object(safeguards, "_always_granted", return_value=set()):
+            for action in actions:
+                with self.subTest(action=action):
+                    decision, _ = safeguards.authorize(action, target="test")
+                    self.assertEqual(decision, safeguards.Decision.APPROVAL_REQUIRED)
+
+    def test_outside_write_path_requires_explicit_approval(self):
+        target = Path(tempfile.gettempdir()) / "orbitdesk-user-approved-test.txt"
+        with patch.object(safeguards, "_always_granted", return_value=set()):
+            decision, _ = safeguards.authorize("create_file", target=str(target))
+            self.assertEqual(decision, safeguards.Decision.APPROVAL_REQUIRED)
+            decision, _ = safeguards.authorize("create_file", target=str(target), approved=True)
+            self.assertEqual(decision, safeguards.Decision.ALLOW)
 
     def test_brain_authorize_calls_are_classified(self):
         source = Path(__file__).with_name("brain.py").read_text(encoding="utf-8")

@@ -25,6 +25,8 @@ from collections import deque
 from pathlib import Path
 
 from safeguards import authorize, Decision
+import automation
+import safeguards
 
 try:
     import psutil
@@ -49,8 +51,8 @@ SYSTEM_PROMPT = (
     "Reply in concise, polished British English. "
     "Address the user as sir now and then, not in every line. "
     "Keep answers short unless asked for detail. "
-    "You cannot run commands, open files or control the computer yourself; "
-    "only OrbitDesk's built-in tools can do that. Never claim you performed an action."
+    "You can only use the narrowly-scoped built-in tools OrbitDesk provides. "
+    "Never claim you performed an action unless a tool confirms it."
 )
 
 # A courtesy filter that gives a clear refusal. It is NOT the real protection:
@@ -87,6 +89,8 @@ WEBSITES = {
     "reddit": "https://www.reddit.com",
     "github": "https://github.com",
     "chatgpt": "https://chatgpt.com",
+    "claude": "https://claude.ai",
+    "antigravity": "https://antigravity.google",
     "wikipedia": "https://www.wikipedia.org",
     "spotify": "https://open.spotify.com",
     "netflix": "https://www.netflix.com",
@@ -286,8 +290,8 @@ def _normalise_command(command):
     "Set timer for 10 minutes."), which would otherwise miss the patterns below.
     """
     text = (command or "").strip().replace("\u2019", "'")
-    # Drop a leading wake word: "Hey OrbitDesk, open calculator" -> "open calculator".
-    text = re.sub(r"^(?:(?:hey|ok|okay|hi|hello)\s+)?orbitdesk\s*[,.:!]?\s+", "", text, flags=re.IGNORECASE)
+    # Drop a leading wake word: "Hey Jarvis, open calculator" -> "open calculator".
+    text = re.sub(r"^(?:(?:hey|ok|okay|hi|hello)\s+)?(?:orbitdesk|jarvis)\s*[,.:!]?\s+", "", text, flags=re.IGNORECASE)
     # Drop trailing punctuation.
     text = re.sub(r"[\s.!?,;]+$", "", text)
     return text
@@ -385,16 +389,25 @@ class LocalAI:
             data = self._post("/api/chat", payload, timeout=120)
         except urllib.error.HTTPError as error:
             if error.code == 404:
+                cloud = self._cloud_fallback(text, remember)
+                if cloud:
+                    return cloud
                 return (
                     f"The model {self.model} isn't installed yet, sir. "
                     f"Run: ollama pull {self.model}"
                 )
             return f"My local AI returned error {error.code}, sir."
         except urllib.error.URLError as error:
+            cloud = self._cloud_fallback(text, remember)
+            if cloud:
+                return cloud
             if isinstance(error.reason, TimeoutError):
                 return "My response timed out, sir. Please try again."
             return "I can't reach my local AI, sir. Please make sure Ollama is running."
         except TimeoutError:
+            cloud = self._cloud_fallback(text, remember)
+            if cloud:
+                return cloud
             return "My response timed out, sir. Please try again."
         except ValueError:
             return "My local AI sent a reply I couldn't read, sir."
@@ -413,13 +426,28 @@ class LocalAI:
 
         return answer
 
+    def _cloud_fallback(self, text, remember):
+        if not automation.cloud_mode_enabled():
+            return None
+        try:
+            answer = automation.ask_cloud(text)
+        except automation.AutomationError as error:
+            return str(error)
+        if answer and remember:
+            with self._lock:
+                self._history.append({"role": "user", "content": text})
+                self._history.append({"role": "assistant", "content": answer})
+        return answer
+
 
 # ---------- BRAIN ----------
 
 class OrbitDeskBrain:
-    def __init__(self, warm_up=True):
+    def __init__(self, warm_up=True, permission_request=None):
         self.running = True
         self.notify = self._print_notification  # the GUI replaces this
+        self.permission_request = permission_request
+        self.audit_callback = None
         self.ai = LocalAI()
 
         self._timers = {}
@@ -440,8 +468,22 @@ class OrbitDeskBrain:
             (r"^(system (?:status|info)|battery|cpu|ram|memory usage|how is my (?:pc|laptop|computer))$",
              self._system_status),
             (r"^(?:calculate|calc|compute)\s+(?P<expression>.+)$", self._calculate),
-            (r"^(?=.*\b(?:plus|minus|times|over|divided by|multiplied by)\b)(?P<expression>[\d\w\s().,+\-*/%^]+)$", self._calculate),
+            (r"^(?=.*\b(?:plus|minus|times|over|divided by|multiplied by)\b)(?P<expression>\d[\d\w\s().,+\-*/%^]*)$", self._calculate),
             (r"^what is (?P<expression>.+)$", self._calculate),
+            (r"^(?:type|dictate)\s+(?P<text>.+)$", self._type_text),
+            (r"^ask chatgpt\s+(?P<prompt>.+)$", self._prompt_chatgpt),
+            (r"^prompt claude with\s+(?P<prompt>.+)$", self._prompt_claude),
+            (r"^send to antigravity\s+(?P<prompt>.+)$", self._prompt_antigravity),
+            (r"^(?:run|execute) command\s+(?P<command>.+)$", self._run_command),
+            (r"^(?:mute|unmute) (?:the )?volume$", self._volume_mute),
+            (r"^(?:set )?volume(?: to)? (?P<level>\d{1,3})(?: percent)?$", self._volume_set),
+            (r"^(?:play|pause|toggle) music$", self._media_toggle),
+            (r"^(?:skip|next)(?: track| song)?$", self._media_next),
+            (r"^(?:previous|last)(?: track| song)$", self._media_previous),
+            (r"^(?:set )?brightness(?: to)? (?P<level>\d{1,3})(?: percent)?$", self._brightness_set),
+            (r"^lock (?:the )?(?:pc|computer|screen)$", self._lock_pc),
+            (r"^minimi[sz]e (?:the )?(?:active )?window$", self._minimize_window),
+            (r"^maximi[sz]e (?:the )?(?:active )?window$", self._maximize_window),
             (r"^convert\s+(?P<amount>-?[\d.]+)\s+(?P<unit_from>[a-z]+)\s+(?:to|in)\s+(?P<unit_to>[a-z]+)$",
              self._convert),
             (r"^(?:set\s+)?(?:a\s+)?timer\s+(?:for\s+)?(?P<amount>[\d.]+)\s+(?P<unit>[a-z]+)$",
@@ -463,6 +505,8 @@ class OrbitDeskBrain:
             (r"^(?:reset|forget) (?:the )?conversation$", self._reset),
             (r"^(?:search youtube(?: for)?|youtube search|find on youtube)\s+(?P<query>.+)$",
              self._search_youtube),
+            (r"^(?:search github(?: for)?|github search)\s+(?P<query>.+)$", self._search_github),
+            (r"^(?:search stack ?overflow(?: for)?|stack ?overflow search)\s+(?P<query>.+)$", self._search_stackoverflow),
             (r"^(?:search wikipedia(?: for)?|wikipedia)\s+(?P<query>.+)$", self._search_wikipedia),
             (r"^(?:search(?: the web| google)? for|google search|look up)\s+(?P<query>.+)$",
              self._search_web),
@@ -480,6 +524,113 @@ class OrbitDeskBrain:
         flags = re.IGNORECASE | re.DOTALL
         return [(re.compile(pattern, flags), handler) for pattern, handler in routes]
 
+    def _interactive_allowed(self, action, target, summary):
+        decision, reason = authorize(action, target=target)
+        if decision == Decision.ALLOW:
+            return True, reason
+        if decision != Decision.APPROVAL_REQUIRED or self.permission_request is None:
+            return False, reason
+        choice = self.permission_request(action, target, summary)
+        if choice == "always":
+            safeguards.grant_always(action, target)
+            return True, "Allowed by user."
+        if choice == "once":
+            return True, "Allowed once by user."
+        return False, "Permission denied."
+
+    def _type_text(self, match):
+        text = match.group("text").strip()
+        try:
+            target_window = automation.get_active_window()
+        except automation.AutomationError as error:
+            return str(error)
+        if target_window is None:
+            return "I couldn't identify the focused window, sir."
+        allowed, reason = self._interactive_allowed(
+            "type_text", "active window", f"Type into the focused app: {text[:180]}"
+        )
+        if not allowed:
+            return reason
+        try:
+            automation.type_text(text, target_window)
+            return "Typed your text into the focused window."
+        except automation.AutomationError as error:
+            return str(error)
+
+    def _prompt_ai(self, target, prompt):
+        allowed, reason = self._interactive_allowed(
+            "prompt_external_ai", target, f"Send this prompt to {target.title()}: {prompt[:180]}"
+        )
+        if not allowed:
+            return reason
+        try:
+            return automation.prompt_ai(target, prompt)
+        except automation.AutomationError as error:
+            return str(error)
+
+    def _prompt_chatgpt(self, match):
+        return self._prompt_ai("chatgpt", match.group("prompt"))
+
+    def _prompt_claude(self, match):
+        return self._prompt_ai("claude", match.group("prompt"))
+
+    def _prompt_antigravity(self, match):
+        return self._prompt_ai("antigravity", match.group("prompt"))
+
+    def _run_command(self, match):
+        command = match.group("command").strip()
+        allowed, reason = self._interactive_allowed(
+            "run_approved_command", "diagnostic", f"Run this diagnostic command: {command}"
+        )
+        if not allowed:
+            return reason
+        try:
+            return automation.run_approved_command(command)
+        except automation.AutomationError as error:
+            return str(error)
+
+    def _system_action(self, action, value=None, permission_action="system_control"):
+        allowed, reason = self._interactive_allowed(permission_action, action, f"Perform {action.replace('_', ' ')}")
+        if not allowed:
+            return reason
+        try:
+            return automation.system_action(action, value)
+        except automation.AutomationError as error:
+            return str(error)
+
+    def _volume_mute(self, match):
+        return self._system_action("volume_mute", permission_action="volume_control")
+
+    def _volume_set(self, match):
+        level = int(match.group("level"))
+        if level > 100:
+            return "Volume must be between 0 and 100 percent."
+        return self._system_action("volume_set", level, "volume_control")
+
+    def _media_toggle(self, match):
+        return self._system_action("media_play_pause")
+
+    def _media_next(self, match):
+        return self._system_action("media_next")
+
+    def _media_previous(self, match):
+        return self._system_action("media_previous")
+
+    def _brightness_set(self, match):
+        level = int(match.group("level"))
+        if level > 100:
+            return "Brightness must be between 0 and 100 percent."
+        return self._system_action("brightness_set", level)
+
+    def _lock_pc(self, match):
+        return self._system_action("lock_pc")
+
+    def _minimize_window(self, match):
+        return self._system_action("minimize_window")
+
+    def _maximize_window(self, match):
+        return self._system_action("maximize_window")
+
     @staticmethod
     def _print_notification(message):
         print(f"\nOrbitDesk: {message}")
@@ -496,6 +647,8 @@ class OrbitDeskBrain:
 
         lowered = text.lower()
         if not CONTENT_TASK.match(lowered) and any(phrase in lowered for phrase in BLOCKED_PHRASES):
+            if self.audit_callback:
+                self.audit_callback("policy filter", "Blocked")
             return (
                 "I can't perform that action, sir. "
                 "It is blocked by OrbitDesk's security policy."
@@ -508,8 +661,15 @@ class OrbitDeskBrain:
                     reply = handler(match)
                 except Exception as error:
                     print(f"[Tool error] {error}")
+                    if self.audit_callback:
+                        self.audit_callback(handler.__name__, "Failed")
                     return "That tool ran into a problem, sir."
                 if reply is not None:
+                    if self.audit_callback:
+                        blocked = any(term in str(reply).casefold() for term in (
+                            "blocked", "not permitted", "permission denied", "not on the approved list",
+                        ))
+                        self.audit_callback(handler.__name__, "Blocked" if blocked else "Completed")
                     return reply
 
         return self.ai.ask(text)
@@ -540,11 +700,10 @@ class OrbitDeskBrain:
 
     def _help(self, _match):
         return (
-            "I can open apps, folders and websites; search the web, YouTube and "
-            "Wikipedia; calculate and convert units; set timers and reminders; "
-            "report system status; keep quick notes; summarise, rewrite or translate "
-            "text; explain error messages; and answer questions with my local AI. "
-            "Try 'set timer for 10 minutes', 'convert 10 km to miles', or 'open calculator'."
+            "I can answer questions, search and open websites, dictate text into the focused app, "
+            "send prompts to ChatGPT, Claude or Antigravity, control audio and brightness, "
+            "launch installed apps, run approved diagnostic commands, calculate, convert units, "
+            "set timers and manage notes. Sensitive actions ask for permission first."
         )
 
     def _reset(self, _match):
@@ -761,6 +920,14 @@ class OrbitDeskBrain:
             if not _is_safe_https(url):
                 return "That web address isn't permitted, sir."
             decision, reason = authorize("open_approved_website", target=url)
+            if decision != Decision.ALLOW and _is_safe_https(url):
+                allowed, reason = self._interactive_allowed(
+                    "navigate_website", url, f"Open this website: {url}"
+                )
+                if allowed:
+                    webbrowser.open(url)
+                    return BRAVE_OPENED
+                return reason
 
         if decision != Decision.ALLOW:
             return reason
@@ -777,6 +944,9 @@ class OrbitDeskBrain:
 
     def open_website(self, name):
         name = name.strip().lower()
+
+        if name.startswith("https://"):
+            return self.open_brave(name)
 
         if name in WEBSITES:
             return self.open_brave(WEBSITES[name])
@@ -807,6 +977,22 @@ class OrbitDeskBrain:
             return reason
         url = "https://www.youtube.com/results?search_query=" + urllib.parse.quote_plus(query)
         return self._browse(url, f"Searching YouTube for {query}, sir.")
+
+    def _search_github(self, match):
+        query = match.group("query").strip()
+        decision, reason = authorize("search_web", target=query)
+        if decision != Decision.ALLOW:
+            return reason
+        url = "https://github.com/search?q=" + urllib.parse.quote_plus(query)
+        return self._browse(url, f"Searching GitHub for {query}, sir.")
+
+    def _search_stackoverflow(self, match):
+        query = match.group("query").strip()
+        decision, reason = authorize("search_web", target=query)
+        if decision != Decision.ALLOW:
+            return reason
+        url = "https://stackoverflow.com/search?q=" + urllib.parse.quote_plus(query)
+        return self._browse(url, f"Searching Stack Overflow for {query}, sir.")
 
     def _search_wikipedia(self, match):
         query = match.group("query").strip()
@@ -897,6 +1083,17 @@ class OrbitDeskBrain:
             result = opener(name)
             if result is not None:
                 return result
+
+        if verb in {"launch", "start", "open"}:
+            allowed, reason = self._interactive_allowed(
+                "launch_program", name, f"Launch the installed program {name}"
+            )
+            if not allowed:
+                return reason
+            try:
+                return automation.launch_program(name)
+            except automation.AutomationError as error:
+                return str(error)
 
         if verb in ("open", "launch"):
             return f"I don't have a shortcut for {name}, sir."

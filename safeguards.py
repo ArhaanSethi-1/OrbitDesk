@@ -15,6 +15,9 @@ disables the feature. test_safeguards.py checks this automatically.
 from pathlib import Path
 from enum import Enum
 import urllib.parse
+import json
+import os
+import threading
 
 
 # ---------- CONFIGURATION ----------
@@ -56,10 +59,51 @@ REQUIRES_APPROVAL = {
     "read_file",
     "create_file",
     "modify_file",
+    "move_file",
     "modify_own_code",
     "send_message",
     "download_file",
+    "type_text",
+    "prompt_external_ai",
+    "launch_program",
+    "system_control",
+    "volume_control",
+    "run_approved_command",
+    "navigate_website",
 }
+
+_PERMISSION_LOCK = threading.Lock()
+_PERMISSION_FILE = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "OrbitDesk" / "permissions.json"
+
+
+def _always_granted():
+    try:
+        data = json.loads(_PERMISSION_FILE.read_text(encoding="utf-8"))
+        return set(data.get("always_allowed", []))
+    except (OSError, ValueError, TypeError):
+        return set()
+
+
+def _grant_key(action, target=None):
+    return f"{str(action).strip().lower()}|{str(target or '*').strip().casefold()}"
+
+
+def grant_always(action, target=None):
+    """Persist a user's Always Allow choice for a supported permission action."""
+    action = str(action).strip().lower()
+    if action not in REQUIRES_APPROVAL:
+        return False
+    with _PERMISSION_LOCK:
+        grants = _always_granted()
+        grants.add(_grant_key(action, target))
+        try:
+            _PERMISSION_FILE.parent.mkdir(parents=True, exist_ok=True)
+            _PERMISSION_FILE.write_text(
+                json.dumps({"always_allowed": sorted(grants)}, indent=2), encoding="utf-8"
+            )
+            return True
+        except OSError:
+            return False
 
 # These actions are blocked regardless of AI suggestions.
 ALWAYS_BLOCKED = {
@@ -86,7 +130,7 @@ APPROVED_FOLDERS = {
 APPROVED_WEBSITE_HOSTS = {
     "youtube.com", "www.youtube.com", "google.com", "www.google.com",
     "mail.google.com", "reddit.com", "www.reddit.com", "github.com",
-    "chatgpt.com", "www.wikipedia.org", "en.wikipedia.org", "open.spotify.com",
+    "chatgpt.com", "claude.ai", "antigravity.google", "www.wikipedia.org", "en.wikipedia.org", "open.spotify.com",
     "www.netflix.com", "www.instagram.com", "discord.com", "web.whatsapp.com",
     "www.amazon.com", "drive.google.com", "maps.google.com", "stackoverflow.com",
     "www.twitch.tv",
@@ -143,6 +187,12 @@ def authorize(action, target=None, approved=False):
     if action in ALWAYS_BLOCKED:
         return Decision.BLOCK, f"Blocked by security policy: {action}"
 
+    if action in REQUIRES_APPROVAL and (
+        _grant_key(action, target) in _always_granted()
+        or _grant_key(action) in _always_granted()
+    ):
+        return Decision.ALLOW, f"Always allowed by user: {action}"
+
     if action == "open_approved_app":
         if str(target or "").strip().casefold() not in APPROVED_APPS:
             return Decision.BLOCK, "The requested app is not on the approved list."
@@ -181,7 +231,9 @@ def authorize(action, target=None, approved=False):
             return Decision.BLOCK, "A file path is required."
         allowed, reason = check_write_path(target)
         if not allowed:
-            return Decision.BLOCK, reason
+            if not approved:
+                return Decision.APPROVAL_REQUIRED, reason + " Explicit permission is required to continue outside that folder."
+            return Decision.ALLOW, "Allowed by explicit user approval outside the normal write folder."
 
     elif action == "modify_own_code":
         # Code changes are never automatically authorized.

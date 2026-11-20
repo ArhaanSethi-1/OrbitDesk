@@ -1,175 +1,81 @@
+"""Low duty cycle wake detection and on-demand local transcription."""
 
-import whisper
-import torch
-import sounddevice as sd
-import numpy as np
-import tempfile
-import wave
 import os
-import time
+import queue
 import re
 import threading
+import time
 from collections import deque
+from pathlib import Path
 
-MODEL_NAME = os.environ.get("JARVIS_WHISPER_MODEL", "tiny.en")
+import numpy as np
+import sounddevice as sd
+
 SAMPLE_RATE = 16000
-DEFAULT_RECORD_SECONDS = 5
-WAKE_WINDOW_SECONDS = 4
-WAKE_CHECK_SECONDS = 2
-WAKE_RMS_THRESHOLD = 12
+WAKE_THRESHOLD = float(os.environ.get("JARVIS_WAKE_THRESHOLD", "0.55"))
 COMMAND_MAX_SECONDS = 15
-VOICE_RMS_THRESHOLD = 12
-TRAILING_SILENCE_SECONDS = 1.2
-INPUT_BLOCK_FRAMES = 1600
-ACTIVITY_BLOCK_FRAMES = int(SAMPLE_RATE * 0.25)
-WAKE_PHRASE = re.compile(
-    r"\b(?:(?:hey|okay|ok|hi)[\s,.:;]+)?orbitdesk\b",
-    re.IGNORECASE,
-)
+TRAILING_SILENCE_SECONDS = 0.9
+VOICE_RMS_THRESHOLD = 110
+INPUT_BLOCK_FRAMES = 1280
+WAKE_PHRASE = re.compile(r"\b(?:hey\s+)?jarvis\b", re.IGNORECASE)
+MIC_DEVICE = None
+_transcriber = None
+_transcriber_lock = threading.Lock()
+_wake_detector = None
+_wake_detector_lock = threading.Lock()
 
-try:
-    CPU_THREADS = max(1, int(os.environ.get("JARVIS_CPU_THREADS", "1")))
-except ValueError:
-    CPU_THREADS = 1
-torch.set_num_threads(CPU_THREADS)
-try:
-    torch.set_num_interop_threads(1)
-except RuntimeError:
-    pass
+
+def _get_transcriber():
+    global _transcriber
+    if _transcriber is None:
+        with _transcriber_lock:
+            if _transcriber is None:
+                from faster_whisper import WhisperModel
+
+                model_name = os.environ.get("JARVIS_WHISPER_MODEL", "base.en")
+                _transcriber = WhisperModel(model_name, device="cpu", compute_type="int8")
+    return _transcriber
+
+
+def _get_wake_detector():
+    global _wake_detector
+    if _wake_detector is None:
+        with _wake_detector_lock:
+            if _wake_detector is None:
+                from openwakeword.model import Model
+
+                custom_jarvis = os.environ.get(
+                    "JARVIS_SINGLE_WAKE_MODEL",
+                    str(Path(os.environ.get("LOCALAPPDATA", "")) / "OrbitDesk" / "models" / "jarvis.onnx"),
+                )
+                wake_models = ["hey_jarvis"]
+                if os.path.isfile(custom_jarvis):
+                    wake_models.append(custom_jarvis)
+                _wake_detector = Model(wakeword_models=wake_models, inference_framework="onnx")
+    return _wake_detector
 
 
 def _select_input_device():
-    """Use the Windows default input, with an explicit index override."""
     configured = os.environ.get("JARVIS_MIC_DEVICE")
     if configured:
         try:
             return int(configured)
         except ValueError:
             pass
-
     try:
         devices = sd.query_devices()
         default_input = sd.default.device[0]
-        if default_input is not None and 0 <= int(default_input) < len(devices):
-            if devices[int(default_input)]["max_input_channels"] > 0:
-                return int(default_input)
-
+        if default_input is not None and int(default_input) >= 0:
+            return int(default_input)
         for index, device in enumerate(devices):
-            if (
-                device["max_input_channels"] > 0
-                and "microphone array" in device["name"].lower()
-            ):
+            if device["max_input_channels"] > 0:
                 return index
     except Exception:
         pass
-
-    return None  # Fall back to the Windows default input device.
+    return None
 
 
 MIC_DEVICE = _select_input_device()
-
-model = None
-_model_lock = threading.Lock()
-
-
-def _get_model():
-    """Load Whisper only when microphone recognition is first used."""
-    global model
-    if model is None:
-        with _model_lock:
-            if model is None:
-                print("Loading Whisper model...")
-                model = whisper.load_model(MODEL_NAME)
-                print("OrbitDesk speech recognition is ready, sir.")
-    return model
-
-
-def _capture_command(stop_event, initial_noise_floor=30.0):
-    """Capture a command and stop after speech followed by a short silence."""
-    chunks = []
-    started_at = time.monotonic()
-    speech_started = False
-    silent_frames = 0
-    noise_floor = max(8.0, float(initial_noise_floor))
-    complete = threading.Event()
-
-    def capture(indata, frames, _time_info, status):
-        nonlocal speech_started, silent_frames, noise_floor
-        if stop_event.is_set():
-            raise sd.CallbackStop
-        if status:
-            print(f"Microphone status: {status}")
-        chunks.append(indata.copy())
-
-        samples = indata.astype(np.float32)
-        rms = float(np.sqrt(np.mean(samples * samples)))
-        threshold = max(VOICE_RMS_THRESHOLD, noise_floor * 1.3)
-        if rms >= threshold:
-            speech_started = True
-            silent_frames = 0
-        elif speech_started:
-            silent_frames += frames
-        else:
-            noise_floor = 0.7 * noise_floor + 0.3 * rms
-
-        timed_out = time.monotonic() - started_at >= COMMAND_MAX_SECONDS
-        silence_done = (
-            speech_started
-            and silent_frames >= int(TRAILING_SILENCE_SECONDS * SAMPLE_RATE)
-        )
-        if timed_out or silence_done:
-            complete.set()
-            raise sd.CallbackStop
-
-    with sd.InputStream(
-        samplerate=SAMPLE_RATE,
-        channels=1,
-        dtype="int16",
-        device=MIC_DEVICE,
-        blocksize=INPUT_BLOCK_FRAMES,
-        callback=capture,
-    ) as stream:
-        try:
-            while not complete.wait(0.1) and not stop_event.is_set():
-                pass
-        finally:
-            try:
-                stream.stop()
-            except Exception:
-                pass
-
-    if stop_event.is_set() or not chunks:
-        return None
-    return np.concatenate(chunks, axis=0)
-
-
-def _transcribe(audio):
-    raw_samples = np.asarray(audio).reshape(-1).astype(np.float32)
-    if not len(raw_samples) or float(np.sqrt(np.mean(raw_samples * raw_samples))) < VOICE_RMS_THRESHOLD:
-        return ""
-    samples = raw_samples / 32768.0
-    audio_blocks = _audio_block_levels(samples, ACTIVITY_BLOCK_FRAMES)
-    if len(audio_blocks):
-        speech_level = float(np.percentile(audio_blocks, 90))
-        gain = min(40.0, 0.08 / max(speech_level, 0.001))
-        if gain > 1.0:
-            samples = np.clip(samples * gain, -1.0, 1.0)
-    result = _get_model().transcribe(
-        samples,
-        fp16=False,
-        language="en",
-        condition_on_previous_text=False,
-    )
-    return (result.get("text") or "").strip()
-
-
-def _audio_block_levels(audio, block_frames):
-    samples = np.asarray(audio, dtype=np.float32).reshape(-1)
-    usable_frames = len(samples) // block_frames * block_frames
-    if usable_frames == 0:
-        return np.empty(0, dtype=np.float32)
-    blocks = samples[:usable_frames].reshape(-1, block_frames)
-    return np.sqrt(np.mean(blocks * blocks, axis=1))
 
 
 def get_input_device_name():
@@ -180,157 +86,162 @@ def get_input_device_name():
         return "Windows default microphone"
 
 
-def _command_after_wake(text):
-    match = WAKE_PHRASE.search(text)
-    if match is None:
-        return None
-    return text[match.end():].strip(" \t\r\n,.:;!?")
+def _play_chime():
+    try:
+        import pygame
+
+        if not pygame.mixer.get_init():
+            pygame.mixer.init(frequency=22050, size=-16, channels=1, buffer=512)
+        sample_rate = pygame.mixer.get_init()[0]
+        duration = 0.18
+        samples = np.arange(int(sample_rate * duration), dtype=np.float32) / sample_rate
+        envelope = np.minimum(1.0, np.minimum(samples * 35.0, (duration - samples) * 22.0))
+        tone = (np.sin(2 * np.pi * 880 * samples) + 0.55 * np.sin(2 * np.pi * 1320 * samples))
+        audio = np.clip(tone * envelope * 9000, -32767, 32767).astype(np.int16)
+        pygame.mixer.Sound(buffer=audio.tobytes()).play()
+    except Exception:
+        pass
 
 
-def listen_for_wake_command(stop_event, on_wake=None, on_activity=None, on_ready=None):
-    """Listen continuously for “Hey OrbitDesk”, then return the spoken command."""
-    max_frames = WAKE_WINDOW_SECONDS * SAMPLE_RATE
-    check_interval = WAKE_CHECK_SECONDS * SAMPLE_RATE
-    audio_chunks = deque()
-    buffered_frames = 0
-    total_frames = 0
-    last_check_frames = 0
-    buffer_lock = threading.Lock()
-    wake_command = None
-    noise_floor = 8.0
+def _capture_command(stop_event):
+    chunks = []
+    started = time.monotonic()
+    voice_started = False
+    silent_seconds = 0.0
+    done = threading.Event()
 
-    def capture(indata, frames, _time_info, status):
-        nonlocal buffered_frames, total_frames
+    def callback(indata, frames, _time_info, status):
+        nonlocal voice_started, silent_seconds
         if stop_event.is_set():
             raise sd.CallbackStop
-        if status:
-            print(f"Microphone status: {status}")
-        chunk = indata.copy()
-        with buffer_lock:
-            audio_chunks.append(chunk)
-            buffered_frames += frames
-            total_frames += frames
-            while buffered_frames > max_frames and audio_chunks:
-                buffered_frames -= len(audio_chunks.popleft())
+        samples = indata.reshape(-1).astype(np.float32)
+        rms = float(np.sqrt(np.mean(samples * samples))) if len(samples) else 0.0
+        if rms >= VOICE_RMS_THRESHOLD:
+            voice_started = True
+            silent_seconds = 0.0
+        elif voice_started:
+            silent_seconds += frames / SAMPLE_RATE
+        chunks.append(indata.copy())
+        elapsed = time.monotonic() - started
+        if (elapsed >= COMMAND_MAX_SECONDS
+                or (not voice_started and elapsed >= 3.5)
+                or (voice_started and silent_seconds >= TRAILING_SILENCE_SECONDS)):
+            done.set()
+            raise sd.CallbackStop
 
-    with sd.InputStream(
-        samplerate=SAMPLE_RATE,
-        channels=1,
-        dtype="int16",
-        device=MIC_DEVICE,
-        blocksize=INPUT_BLOCK_FRAMES,
-        callback=capture,
-    ) as stream:
-        if on_ready is not None:
+    with sd.InputStream(samplerate=SAMPLE_RATE, channels=1, dtype="int16",
+                        device=MIC_DEVICE, blocksize=INPUT_BLOCK_FRAMES,
+                        callback=callback) as stream:
+        try:
+            while not done.wait(0.08) and not stop_event.is_set():
+                pass
+        finally:
+            try:
+                stream.stop()
+            except Exception:
+                pass
+    if stop_event.is_set() or not chunks:
+        return None
+    return np.concatenate(chunks, axis=0).reshape(-1).astype(np.float32) / 32768.0
+
+
+def _transcribe(audio):
+    if audio is None or not len(audio):
+        return ""
+    segments, _info = _get_transcriber().transcribe(
+        audio, language="en", beam_size=1, vad_filter=True,
+        vad_parameters={"min_silence_duration_ms": 400},
+    )
+    return " ".join(segment.text.strip() for segment in segments).strip()
+
+
+def _remove_wake_phrase(text):
+    return WAKE_PHRASE.sub("", text, count=1).strip(" \t\r\n,.:;!?-")
+
+
+def listen_for_wake_command(stop_event, on_wake=None, on_activity=None, on_ready=None,
+                            is_speaking=None, on_interrupt=None):
+    """Wait for an openWakeWord trigger, then capture one command."""
+    try:
+        detector = _get_wake_detector()
+    except ImportError as error:
+        raise RuntimeError("Wake word support is missing. Run setup.bat to install it.") from error
+    audio_queue = queue.Queue(maxsize=12)
+    interruption_audio = deque(maxlen=16)
+    interruption_frames = 0
+
+    def callback(indata, frames, _time_info, status):
+        if stop_event.is_set():
+            raise sd.CallbackStop
+        try:
+            audio_queue.put_nowait(indata.copy().reshape(-1))
+        except queue.Full:
+            try:
+                audio_queue.get_nowait()
+                audio_queue.put_nowait(indata.copy().reshape(-1))
+            except queue.Empty:
+                pass
+
+    with sd.InputStream(samplerate=SAMPLE_RATE, channels=1, dtype="int16",
+                        device=MIC_DEVICE, blocksize=1280, callback=callback) as stream:
+        if on_ready:
             on_ready()
         try:
             while not stop_event.is_set():
-                time.sleep(0.1)
-                with buffer_lock:
-                    if buffered_frames < max_frames:
-                        continue
-                    if total_frames - last_check_frames < check_interval:
-                        continue
-                    last_check_frames = total_frames
-                    audio = np.concatenate(tuple(audio_chunks), axis=0)[-max_frames:]
-
-                samples = audio.reshape(-1).astype(np.float32)
-                block_rms = _audio_block_levels(samples, ACTIVITY_BLOCK_FRAMES)
-                rms = float(np.max(block_rms)) if len(block_rms) else 0.0
-                if on_activity is not None:
-                    on_activity(rms, "")
-                if not len(block_rms):
+                try:
+                    chunk = audio_queue.get(timeout=0.25)
+                except queue.Empty:
                     continue
-                estimated_noise = float(np.percentile(block_rms, 25))
-                noise_floor = 0.5 * noise_floor + 0.5 * estimated_noise
-                threshold = max(WAKE_RMS_THRESHOLD, noise_floor * 1.25)
-                voiced_blocks = int(np.count_nonzero(block_rms >= threshold))
-                if voiced_blocks < 2:
+                if is_speaking is not None and is_speaking():
+                    interruption_audio.append(chunk)
+                    interruption_frames += len(chunk)
+                    if interruption_frames >= int(SAMPLE_RATE * 1.2):
+                        interruption_frames = 0
+                        clip = np.concatenate(tuple(interruption_audio)).astype(np.float32) / 32768.0
+                        interruption_audio.clear()
+                        rms = float(np.sqrt(np.mean(clip * clip))) if len(clip) else 0.0
+                        if rms > VOICE_RMS_THRESHOLD / 32768.0:
+                            words = _transcribe(clip).casefold().strip(" .,!?").split()
+                            if words and len(words) <= 4 and words[0] in {"stop", "cancel"}:
+                                if on_interrupt:
+                                    on_interrupt()
+                                detector.reset()
+                                continue
+                else:
+                    interruption_audio.clear()
+                    interruption_frames = 0
+                scores = detector.predict(chunk)
+                score = max((float(value) for value in scores.values()), default=0.0)
+                if on_activity:
+                    level = float(np.sqrt(np.mean(chunk.astype(np.float32) ** 2))) / 32768.0
+                    on_activity(level, "")
+                if score < WAKE_THRESHOLD:
                     continue
-
-                transcript = _transcribe(audio)
-                with buffer_lock:
-                    last_check_frames = total_frames
-                if stop_event.is_set():
-                    return None
-                if on_activity is not None:
-                    on_activity(rms, transcript)
-                wake_command = _command_after_wake(transcript)
-                if wake_command is not None:
-                    break
+                detector.reset()
+                if on_wake:
+                    on_wake()
+                _play_chime()
+                try:
+                    stream.stop()
+                except Exception:
+                    pass
+                break
         finally:
             try:
                 stream.stop()
             except Exception:
                 pass
 
-    if stop_event.is_set() or wake_command is None:
+    if stop_event.is_set():
         return None
-    if on_wake is not None:
-        on_wake()
-    if wake_command:
-        return wake_command
-
-    command_audio = _capture_command(stop_event, noise_floor)
-    if command_audio is None:
+    command = _transcribe(_capture_command(stop_event))
+    if stop_event.is_set():
         return None
-    transcript = _transcribe(command_audio)
-    command = _command_after_wake(transcript)
-    return command if command is not None else transcript.strip()
+    return _remove_wake_phrase(command) or command
 
 
 def listen():
-    """Record a short sample for standalone microphone checks."""
-    print(f"\nListening for {DEFAULT_RECORD_SECONDS} seconds... Speak now!")
-    audio = sd.rec(
-        int(DEFAULT_RECORD_SECONDS * SAMPLE_RATE),
-        samplerate=SAMPLE_RATE,
-        channels=1,
-        dtype="int16",
-        device=MIC_DEVICE,
-    )
-    sd.wait()
-    print("Recording complete.")
-    print("Peak level:", audio.max(), audio.min())
-
-    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp:
-        audio_path = temp.name
-
-    try:
-        with wave.open(audio_path, "wb") as wav_file:
-            wav_file.setnchannels(1)
-            wav_file.setsampwidth(2)
-            wav_file.setframerate(SAMPLE_RATE)
-            wav_file.writeframes(audio.tobytes())
-
-        print("Transcribing your speech...")
-
-        result = _get_model().transcribe(
-            audio_path,
-            fp16=False,
-            language="en"
-        )
-
-        text = result["text"].strip()
-        print(f"You said: {text if text else '[Nothing detected]'}")
-        return text
-
-    finally:
-        if os.path.exists(audio_path):
-            os.remove(audio_path)
-
-
-if __name__ == "__main__":
-    while True:
-        try:
-            command = listen()
-            if command.lower() in ["exit", "quit", "stop listening"]:
-                print("Speech recognition test complete, sir.")
-                break
-        except KeyboardInterrupt:
-            print("\nOrbitDesk speech test stopped.")
-            break
-        except Exception as error:
-            print(f"Speech recognition error: {error}")
-            break
-
+    """Record one utterance for the standalone audio check utility."""
+    stop = threading.Event()
+    audio = _capture_command(stop)
+    return _transcribe(audio)

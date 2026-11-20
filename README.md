@@ -1,170 +1,60 @@
-# OrbitDesk — Personal AI Desktop Assistant
+# OrbitDesk Jarvis
 
-A personal desktop AI assistant built with Python, designed to bring local AI conversations, voice interaction, browser control, and desktop automation into one application.
-
-OrbitDesk uses a locally running Ollama model for AI-powered responses and provides a desktop interface for interacting with the assistant.
-
-> **Project status:** Early development. Features and security controls are still being tested and improved.
+OrbitDesk is a Windows voice assistant with a PySide6 dashboard, tray controls, a floating Arc Reactor orb, on-device wake detection, local speech transcription, and guarded desktop automation.
 
 ## Features
 
-- **Local AI conversations** — Uses Ollama with the `qwen2.5:3b` model.
-- **Desktop interface** — A custom dark-themed Tkinter GUI.
-- **Voice interaction** — Microphone input and spoken responses.
-- **Tray-first controls** — OrbitDesk starts in the system tray; open it from the tray or toggle the microphone there.
-- **On-demand orb** — The compact orb appears after “Hey OrbitDesk” and hides when the interaction ends.
-- **Low-resource wake word** — Uses Whisper `tiny.en` with one CPU thread and skips transcription when the microphone is quiet.
-- **Browser control** — Opens Brave when available, with a default-browser fallback.
-- **Web search** — Searches Google and YouTube.
-- **Website shortcuts** — Opens commonly used websites.
-- **Desktop automation** — Launches supported applications and opens common folders.
-- **Safe arithmetic** — Evaluates basic mathematical expressions using a restricted calculator.
-- **Security policy prototype** — A separate safeguards module defines allowed, approval-required, and blocked actions.
-- **Unit tests** — Checks the security policy and action classification.
+- OpenWakeWord detection for **Hey Jarvis**, with no Whisper inference during idle listening.
+- Optional custom `jarvis.onnx` wake model for the standalone **Jarvis** phrase. Place it at `%LOCALAPPDATA%\OrbitDesk\models\jarvis.onnx`, or set `JARVIS_SINGLE_WAKE_MODEL` to a model path.
+- Faster Whisper `base.en` transcription on CPU with VAD and silence-based command capture.
+- Edge TTS with an optional SAPI5 offline fallback and interruptible audio playback. Set `JARVIS_VOICE` to select a different Edge voice.
+- PySide6-only dashboard, tray-first startup, visual waveform, animated orb, action audit, and permission dialogs.
+- Dictation into the focused window and explicit prompts to ChatGPT, Claude, or Antigravity.
+- Permission-gated controls for audio, media, brightness, window state, launching Start Menu programs, external AI prompts, and a small read-only terminal diagnostic allowlist.
+- Optional API-key fallback for ChatGPT, Claude, and Gemini-compatible prompts.
 
-## Tech Stack
+## Install and run
 
-| Technology | Purpose |
-|---|---|
-| Python 3.10 | Core application |
-| Tkinter | Desktop GUI |
-| PySide6 | Animated orb interface |
-| Ollama | Local AI inference |
-| Qwen 2.5 3B | Language model |
-| Whisper `tiny.en` | Low-resource English speech recognition |
-| Edge TTS | Text-to-speech |
-| Git and GitHub | Version control and project hosting |
+Run `setup.bat`. Select one of the setup choices:
 
-## Project Structure
+1. **Complete Setup with Local AI** installs dependencies and offers to pull `qwen2.5:3b` through an installed Ollama. The model download is opt-in.
+2. **Lightweight Setup** installs voice and desktop capabilities without downloading a local AI model. Optional cloud keys make general questions use the configured API provider.
+3. **Test Audio & Microphone** installs dependencies and records a short microphone check.
+4. **Exit**.
 
-```text
-orbitdesk/
-├── main.py             # Desktop GUI and application controls
-├── brain.py            # Command routing and AI integration
-├── safeguards.py       # Security policy prototype
-├── speech.py           # Speech recognition
-├── speech_output.py    # Spoken responses
-├── test_security.py    # Security policy tests
-├── test_safeguards.py  # Additional safeguards tests
-├── voice_test.py       # Voice testing
-├── .gitignore          # Files excluded from Git
-└── README.md           # Project documentation
+Python 3.10, 3.11, or 3.12 is supported. Once setup completes, run `run.bat`. The application starts minimized to the tray; say “Hey Jarvis” to activate an interaction, or open the dashboard from the tray.
+
+## Optional API keys
+
+Create a local `.env` file in the project directory. Do not commit it:
+
+```dotenv
+OPENAI_API_KEY=...
+ANTHROPIC_API_KEY=...
+GEMINI_API_KEY=...
+JARVIS_VOICE=en-GB-RyanNeural
 ```
 
-## Requirements
+The assistant uses these keys only for explicitly requested AI prompts, or for general questions when Lightweight Setup is selected. Sending a prompt to an external AI service requires permission unless that provider was explicitly set to Always Allow.
 
-- Windows 10 or Windows 11
-- Python 3.10
-- Ollama
-- The required Python packages for speech recognition, audio playback, and text-to-speech
-- A microphone for voice input
-- An internet connection for web searches and online TTS services
+## Command examples
 
-OrbitDesk starts minimized to the system tray and listens while **MIC ON** is enabled.
-Double-click the tray icon to open the main window; right-click it to hide the
-window, pause the microphone, toggle spoken replies, or exit. Closing the main
-window sends OrbitDesk back to the tray.
+- “Jarvis, type I’ll be there at 3.”
+- “Ask ChatGPT to summarise this paragraph: …”
+- “Prompt Claude with …”
+- “Send to Antigravity …”
+- “Set volume to 30 percent”, “mute volume”, “skip track”, or “set brightness to 60 percent”.
+- “Launch Notepad” or “run command whoami”.
+- “Search the web for …” or “open website example.com”.
 
-OrbitDesk uses the Windows default microphone, falling back to a detected microphone
-array if needed. It adapts to background noise and boosts quiet speech locally.
-Say "Hey OrbitDesk" followed by a command, such as "Hey OrbitDesk, what time is it?"
-The compact orb appears during the interaction and hides when OrbitDesk is ready for
-the next wake word. The first microphone start downloads Whisper `tiny.en` if it
-is not already cached; later launches reuse it.
+Permission-sensitive actions show an Allow Once / Always Allow / Deny prompt and accept a spoken “yes, proceed” or “deny”. Terminal requests are confined to read-only diagnostics and do not invoke a shell.
 
-## Getting Started
+## Diagnostics and tests
 
-### 1. Install Ollama
+Application diagnostics use a rotating log at `%LOCALAPPDATA%\OrbitDesk\logs\orbitdesk.log`.
 
-Install Ollama from [ollama.com](https://ollama.com/).
-
-Download the model used by OrbitDesk:
+Run the tests with:
 
 ```powershell
-ollama pull qwen2.5:3b
+python -m unittest discover -v
 ```
-
-Make sure Ollama is running before launching the assistant.
-
-### 2. Set up Python
-
-Open a terminal in the project directory and verify Python:
-
-```powershell
-py -3.10 --version
-```
-
-Install the Python dependencies required by the project. The dependency list will be documented more precisely as development progresses.
-
-### 3. Launch OrbitDesk
-
-Run the launcher from the project directory:
-
-```powershell
-.\run.bat
-```
-
-OrbitDesk starts in the system tray. Double-click its icon to open the window.
-
-## Example Commands
-
-Try commands such as:
-
-- `hello`
-- `what time is it`
-- `calculate 25 * 4`
-- `open calculator`
-- `open GitHub`
-- `search the web for Python tutorials`
-- `search YouTube for music`
-- `open Downloads`
-
-Available commands depend on the current implementation and installed applications.
-
-## Run the checks
-
-From the project directory, run:
-
-```powershell
-py -3.10 -m unittest discover -v
-```
-
-The security checks use Python's test runner, so failures produce a non-zero exit code.
-
-## Security
-
-OrbitDesk includes an experimental safeguards module intended to classify actions as allowed, requiring approval, or blocked.
-
-The current policy is an application-level control, **not a complete security sandbox**. Passing standalone policy tests does not establish that every action in the running application is protected.
-
-Security improvements planned for future versions include:
-
-- Enforcing policy checks at every action-execution point
-- Validating action targets and restricting permissions
-- Implementing genuine user approval flows for sensitive actions
-- Expanding automated integration tests
-- Improving error handling and security logging
-
-Do not use the current prototype to handle sensitive information or perform unattended, high-impact actions.
-
-## Roadmap
-
-- [ ] Improve safeguards and integration tests
-- [ ] Add a complete dependency and installation guide
-- [ ] Improve speech recognition reliability
-- [ ] Expand supported commands
-- [ ] Add better conversation history management
-- [ ] Document architecture and development decisions
-- [ ] Add screenshots and demonstrations
-
-## Copyright
-
-Copyright © 2026 arhaansethi890-tech. All rights reserved.
-
-This project is published for viewing and inspection. No general permission to reuse, modify, or redistribute the code is granted. See the project's copyright notice for details.
-
-## Author
-
-**GitHub:** [@arhaansethi890-tech](https://github.com/arhaansethi890-tech)
-
-This project is under active development. Features, architecture, and documentation may change as it evolves.

@@ -1,128 +1,65 @@
-
 @echo off
-setlocal
+setlocal EnableExtensions
 cd /d "%~dp0"
 
 echo ========================================
-echo         OrbitDesk - Initial Setup
+echo       OrbitDesk Jarvis Setup
 echo ========================================
 echo.
 
-:: Prefer the Python launcher, but support installations with python.exe only.
+set "PYTHON_LAUNCHER="
 where py >nul 2>&1
-if errorlevel 1 (
+if not errorlevel 1 (
+    for %%V in (3.12 3.11 3.10) do (
+        py -%%V -c "import sys" >nul 2>&1
+        if not errorlevel 1 if not defined PYTHON_LAUNCHER set "PYTHON_LAUNCHER=py -%%V"
+    )
+)
+
+if not defined PYTHON_LAUNCHER (
     where python >nul 2>&1
     if errorlevel 1 (
-        echo ERROR: Python 3 was not found. Install Python 3.10 or newer.
+        echo Python 3.10, 3.11, or 3.12 was not found.
+        echo Install Python from https://www.python.org/downloads/
         pause
         exit /b 1
     )
-    python -c "import sys; exit(0 if sys.version_info >= (3,10) else 1)"
-) else (
-    py -3 -c "import sys; exit(0 if sys.version_info >= (3,10) else 1)"
-)
-if errorlevel 1 (
-    echo ERROR: Python 3.10 or newer is required.
-    pause
-    exit /b 1
-)
-
-:: Check required project files
-if not exist "requirements.txt" (
-    echo ERROR: requirements.txt is missing.
-    pause
-    exit /b 1
-)
-
-if not exist "main.py" (
-    echo ERROR: main.py is missing.
-    pause
-    exit /b 1
-)
-
-:: Create virtual environment if needed
-if not exist ".venv\Scripts\python.exe" (
-    echo Creating Python virtual environment...
-    where py >nul 2>&1
-    if not errorlevel 1 (
-        py -3 -m venv .venv
-    ) else (
-        python -m venv .venv
+    python -c "import sys; exit(0 if (3,10) <= sys.version_info[:2] <= (3,12) else 1)"
+    if errorlevel 1 (
+        echo Python 3.10 through 3.12 is required.
+        pause
+        exit /b 1
     )
+    set "PYTHON_LAUNCHER=python"
+)
+
+if not defined PYTHON_LAUNCHER (
+    echo Python 3.10, 3.11, or 3.12 was not found.
+    pause
+    exit /b 1
+)
+
+if not exist ".venv\Scripts\python.exe" (
+    echo Creating the OrbitDesk virtual environment...
+    %PYTHON_LAUNCHER% -m venv .venv
     if errorlevel 1 goto :error
 )
 
-:: Verify virtual environment Python version
-".venv\Scripts\python.exe" -c "import sys; exit(0 if sys.version_info >= (3,10) else 1)"
+".venv\Scripts\python.exe" -c "import sys; exit(0 if (3,10) <= sys.version_info[:2] <= (3,12) else 1)"
 if errorlevel 1 (
-    echo ERROR: Existing .venv does not use Python 3.10 or newer.
-    echo Rename or remove .venv, then run setup.bat again.
+    echo The existing .venv must use Python 3.10, 3.11, or 3.12.
+    echo Rename .venv and run setup.bat again to recreate it.
     goto :error
 )
 
-echo.
-echo Installing Python dependencies...
 ".venv\Scripts\python.exe" -m pip install --upgrade pip
 if errorlevel 1 goto :error
-
-".venv\Scripts\python.exe" -m pip install -r requirements.txt
+".venv\Scripts\python.exe" setup.py
 if errorlevel 1 goto :error
-
-echo.
-echo Checking Ollama...
-where ollama >nul 2>&1
-if errorlevel 1 (
-    echo WARNING: Ollama is not installed or not on PATH.
-    echo Install it from https://ollama.com
-    echo Then run setup.bat again to download the AI model.
-    goto :success
-)
-
-:: Check whether Ollama API is available
-call :ollama_ok
-if errorlevel 1 (
-    echo Starting Ollama...
-    start "" /min ollama serve
-)
-
-:: Wait for Ollama API
-set "OLLAMA_READY="
-for /L %%i in (1,1,30) do (
-    call :ollama_ok
-    if not errorlevel 1 set "OLLAMA_READY=1"
-    if defined OLLAMA_READY goto :ollama_ready
-    timeout /t 1 /nobreak >nul
-)
-
-echo WARNING: Ollama did not respond within 30 seconds.
-echo Start Ollama manually, then run: ollama pull qwen2.5:3b
-goto :success
-
-:ollama_ready
-echo Ollama is responding.
-echo Downloading or verifying qwen2.5:3b...
-ollama pull qwen2.5:3b
-if errorlevel 1 (
-    echo WARNING: Model download failed.
-    echo Retry later using: ollama pull qwen2.5:3b
-)
-
-:success
-echo.
-echo ========================================
-echo Setup steps completed.
-echo Run run.bat to launch OrbitDesk.
-echo ========================================
-pause
 exit /b 0
 
 :error
 echo.
-echo SETUP FAILED. Read the error messages above.
+echo Setup could not complete. Review the error above.
 pause
 exit /b 1
-
-:ollama_ok
-powershell -NoProfile -Command "try { Invoke-RestMethod -Uri 'http://127.0.0.1:11434/api/tags' -TimeoutSec 2 | Out-Null; exit 0 } catch { exit 1 }" >nul 2>&1
-if errorlevel 1 exit /b 1
-exit /b 0

@@ -50,6 +50,10 @@ class OrbitDeskOrb(QWidget):
     session_requested = Signal(str)
     hide_requested = Signal()
     exit_requested = Signal()
+    dashboard_requested = Signal()
+    settings_requested = Signal()
+    mute_requested = Signal()
+    background_requested = Signal()
 
     def __init__(self):
         super().__init__()
@@ -60,8 +64,10 @@ class OrbitDeskOrb(QWidget):
             Qt.WindowType.FramelessWindowHint
             | Qt.WindowType.WindowStaysOnTopHint
             | Qt.WindowType.Tool          # no taskbar button
+            | Qt.WindowType.WindowDoesNotAcceptFocus
         )
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
 
         # Compact Siri-style status bubble, shown only during an interaction.
         self.bubble = QLabel("", None, Qt.WindowType.Tool |
@@ -281,7 +287,7 @@ class OrbitDeskOrb(QWidget):
         p.drawText(
             0, ORB_SIZE - 22, ORB_SIZE, 16,
             Qt.AlignmentFlag.AlignCenter,
-            f"OrbitDesk  \u2022  {self.state.upper()}",
+            f"JARVIS  \u2022  {self.state.upper()}",
         )
         p.end()
 
@@ -375,6 +381,11 @@ class OrbitDeskOrb(QWidget):
             QMenu::item:selected { background: #173b58; }
         """)
 
+        menu.addAction("Open Dashboard").triggered.connect(self.dashboard_requested.emit)
+        menu.addAction("Mute Microphone").triggered.connect(self.mute_requested.emit)
+        menu.addAction("Run in Background").triggered.connect(self.background_requested.emit)
+        menu.addAction("Settings").triggered.connect(self.settings_requested.emit)
+        menu.addSeparator()
         state_menu = menu.addMenu("Set visual state")
         for state in self.STATES:
             action = state_menu.addAction(state)

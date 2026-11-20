@@ -1,946 +1,534 @@
+"""Single-runtime PySide6 dashboard and voice controller for OrbitDesk."""
 
-# Keep diagnostics available when OrbitDesk starts with pythonw.exe.
+import datetime
+import logging
+import math
 import os
 import sys
+import tempfile
 import threading
-import logging
+import html
 from logging.handlers import RotatingFileHandler
 
 _log_dir = os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), "OrbitDesk", "logs")
 try:
     os.makedirs(_log_dir, exist_ok=True)
-    _handler = RotatingFileHandler(os.path.join(_log_dir, "orbitdesk.log"), maxBytes=2_000_000, backupCount=4, encoding="utf-8")
-    logging.basicConfig(level=logging.INFO, handlers=[_handler], format="%(asctime)s %(levelname)s %(threadName)s %(message)s")
+    logging.basicConfig(
+        level=logging.INFO,
+        handlers=[RotatingFileHandler(os.path.join(_log_dir, "orbitdesk.log"), maxBytes=2_000_000, backupCount=4, encoding="utf-8")],
+        format="%(asctime)s %(levelname)s %(threadName)s %(message)s",
+    )
 except OSError:
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    try:
+        _fallback_log_dir = os.path.join(tempfile.gettempdir(), "OrbitDesk", "logs")
+        os.makedirs(_fallback_log_dir, exist_ok=True)
+        logging.basicConfig(
+            level=logging.INFO,
+            handlers=[RotatingFileHandler(os.path.join(_fallback_log_dir, "orbitdesk.log"), maxBytes=2_000_000, backupCount=2, encoding="utf-8")],
+            format="%(asctime)s %(levelname)s %(threadName)s %(message)s",
+        )
+    except OSError:
+        logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
 
-def _log_uncaught_exception(exc_type, exc_value, exc_traceback):
+def _uncaught_exception(exc_type, exc_value, exc_traceback):
     if issubclass(exc_type, KeyboardInterrupt):
         return sys.__excepthook__(exc_type, exc_value, exc_traceback)
     logging.critical("Uncaught application exception", exc_info=(exc_type, exc_value, exc_traceback))
 
 
-sys.excepthook = _log_uncaught_exception
-
-
-def _log_thread_exception(args):
+def _uncaught_thread(args):
     logging.critical(
         "Uncaught exception in thread %s", args.thread.name if args.thread else "unknown",
         exc_info=(args.exc_type, args.exc_value, args.exc_traceback),
     )
 
 
-threading_excepthook = getattr(threading, "excepthook", None)
-if threading_excepthook is not None:
-    threading.excepthook = _log_thread_exception
-if sys.stdout is None:
-    class _LogStream:
-        def __init__(self, level):
-            self.level = level
-            self._buffer = ""
+sys.excepthook = _uncaught_exception
+threading.excepthook = _uncaught_thread
 
-        def write(self, value):
-            self._buffer += str(value)
-            while "\n" in self._buffer:
-                line, self._buffer = self._buffer.split("\n", 1)
-                if line.strip():
-                    logging.log(self.level, line)
-            return len(value)
-
-        def flush(self):
-            if self._buffer.strip():
-                logging.log(self.level, self._buffer)
-            self._buffer = ""
-
-    sys.stdout = _LogStream(logging.INFO)
-if sys.stderr is None:
-    sys.stderr = _LogStream(logging.ERROR)
-
-# Enable sharper Windows rendering before creating the Tkinter window.
-try:
-    import ctypes
-    ctypes.windll.shcore.SetProcessDpiAwareness(2)
-except Exception:
-    pass
-
-import tkinter as tk
-from tkinter import scrolledtext
-import datetime
-
-from PySide6.QtCore import Qt
-from PySide6.QtGui import QColor, QIcon, QPainter, QPixmap
-from PySide6.QtWidgets import QApplication, QMenu, QSystemTrayIcon
+from PySide6.QtCore import QObject, Qt, QTimer, Signal
+from PySide6.QtGui import QColor, QIcon, QPainter, QPen, QPixmap
+from PySide6.QtWidgets import (
+    QApplication, QDialog, QHBoxLayout, QLabel, QLineEdit, QListWidget,
+    QMainWindow, QPushButton, QSystemTrayIcon, QTabWidget, QTextBrowser,
+    QVBoxLayout, QWidget,
+)
 
 from brain import OrbitDeskBrain
+import automation
 from orb import OrbitDeskOrb
-from speech_output import speak
+from speech_output import VOICE, is_speaking, speak, stop_speaking
+
+APP_STYLE = """
+QMainWindow, QWidget { background: #0a0d14; color: #eaf2ff; font-family: 'Segoe UI'; }
+QTabWidget::pane { border: 1px solid #1c2d42; border-radius: 9px; }
+QTabBar::tab { background: #111a27; padding: 10px 18px; border: 1px solid #1c2d42; }
+QTabBar::tab:selected { color: #00e5ff; border-bottom: 2px solid #00e5ff; }
+QTextBrowser, QListWidget { background: #0e1420; border: 1px solid #1b2a3d; border-radius: 8px; padding: 10px; }
+QLineEdit { background: #101927; border: 1px solid #28415d; border-radius: 8px; padding: 12px; color: white; }
+QPushButton { background: #102535; color: #00e5ff; border: 1px solid #1b6172; border-radius: 7px; padding: 9px 15px; }
+QPushButton:hover { background: #173849; }
+QTextBrowser pre, QTextBrowser div.codehilite { background: #080d15; border: 1px solid #1b2a3d; border-radius: 6px; padding: 8px; }
+QTextBrowser code { color: #7ee7ff; font-family: 'Cascadia Code'; }
+"""
 
 
-# ---------- RED OrbitDesk THEME ----------
-BG = "#080808"
-PANEL = "#141414"
-PANEL2 = "#202020"
-RED = "#FF3030"
-RED_DARK = "#701010"
-WHITE = "#FFFFFF"
-GREY = "#C0C0C0"
-GREEN = "#55F59B"
-YELLOW = "#FFD166"
+class PermissionBridge(QObject):
+    requested = Signal(object)
+    audit = Signal(str, str)
 
-FONT = "Segoe UI"
-MONO = "Cascadia Mono"
+    def __init__(self):
+        super().__init__()
+        self._lock = threading.Lock()
+        self._pending = None
+
+    def ask(self, action, target, summary):
+        event = threading.Event()
+        request = {"action": action, "target": target, "summary": summary, "event": event, "choice": "deny"}
+        with self._lock:
+            if self._pending is not None:
+                return "deny"
+            self._pending = request
+        self.requested.emit(request)
+        event.wait(120)
+        with self._lock:
+            if self._pending is request:
+                self._pending = None
+        choice = request["choice"]
+        self.audit.emit(action, "Allowed once" if choice == "once" else "Always allowed" if choice == "always" else "Denied")
+        return choice
+
+    def resolve(self, choice):
+        with self._lock:
+            request = self._pending
+            if request is None:
+                return False
+            request["choice"] = choice if choice in {"once", "always"} else "deny"
+            request["event"].set()
+            self._pending = None
+        return True
+
+    def has_pending(self):
+        with self._lock:
+            return self._pending is not None
 
 
-def build_tray_icon():
-    """Draw a compact OrbitDesk mark without adding an image dependency."""
+class PermissionDialog(QDialog):
+    def __init__(self, request, broker, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("OrbitDesk permission")
+        self.broker = broker
+        self.resolved = False
+        self.setWindowModality(Qt.WindowModality.NonModal)
+        self.setStyleSheet("QDialog{background:#0c1420;color:#edf7ff;} QLabel{font-size:12pt;} QPushButton{padding:9px 13px;}")
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel("Permission requested"))
+        layout.addWidget(QLabel(request["summary"]))
+        buttons = QHBoxLayout()
+        for label, choice in (("Allow Once", "once"), ("Always Allow", "always"), ("Deny", "deny")):
+            button = QPushButton(label)
+            button.clicked.connect(lambda _checked=False, c=choice: self._finish(broker, c))
+            buttons.addWidget(button)
+        layout.addLayout(buttons)
+        self.setFixedWidth(440)
+
+    def _finish(self, broker, choice):
+        self.resolved = True
+        broker.resolve(choice)
+        self.close()
+
+    def closeEvent(self, event):
+        if not self.resolved:
+            self.broker.resolve("deny")
+        event.accept()
+
+
+class Waveform(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.level = 0.0
+        self.target_level = 0.0
+        self.phase = 0.0
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self._tick)
+        self.timer.start(40)
+        self.setMinimumHeight(70)
+
+    def set_active(self, active):
+        self.active = active
+        if not active:
+            self.target_level = 0.02
+        self.update()
+
+    def set_audio_level(self, level):
+        self.active = level > 0.015
+        self.target_level = min(1.0, max(0.02, float(level) * 18.0))
+
+    def _tick(self):
+        self.phase += 0.13
+        self.level += (self.target_level - self.level) * 0.32
+        self.update()
+
+    def paintEvent(self, _event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setPen(QPen(QColor("#00e5ff"), 2))
+        mid = self.height() / 2
+        points = []
+        for x in range(0, self.width(), 4):
+            amp = (8 + 20 * self.level) * (0.3 + 0.7 * abs(math.sin(x * 0.035 + self.phase)))
+            points.append((x, mid + math.sin(x * 0.07 + self.phase) * amp))
+        for left, right in zip(points, points[1:]):
+            painter.drawLine(int(left[0]), int(left[1]), int(right[0]), int(right[1]))
+
+
+def _tray_icon():
     pixmap = QPixmap(32, 32)
     pixmap.fill(Qt.GlobalColor.transparent)
     painter = QPainter(pixmap)
     painter.setRenderHint(QPainter.RenderHint.Antialiasing)
     painter.setPen(Qt.PenStyle.NoPen)
-    painter.setBrush(QColor("#101522"))
-    painter.drawEllipse(1, 1, 30, 30)
-    painter.setBrush(QColor("#50DFFF"))
-    painter.drawEllipse(5, 5, 22, 22)
-    painter.setBrush(QColor("#101522"))
+    painter.setBrush(QColor("#00e5ff"))
+    painter.drawEllipse(3, 3, 26, 26)
+    painter.setBrush(QColor("#0a0d14"))
     painter.drawEllipse(9, 9, 14, 14)
-    painter.setBrush(QColor("#D9FAFF"))
-    painter.drawEllipse(13, 13, 6, 6)
     painter.end()
     return QIcon(pixmap)
 
 
-class OrbitDeskGUI:
-    def __init__(self, root, qt_app):
-        self.root = root
-        self.qt_app = qt_app
-        self.orbitdesk = OrbitDeskBrain()
+class OrbitDeskWindow(QMainWindow):
+    message_added = Signal(str, str)
+    status_changed = Signal(str)
+    wake_changed = Signal(bool)
+    wake_triggered = Signal()
+    audio_level_changed = Signal(float)
+    permission_announcement = Signal(str)
+    permission_resolved = Signal()
+    shutdown_requested = Signal()
 
+    def __init__(self, app):
+        super().__init__()
+        self.app = app
         self.closing = False
-        self.busy = False
         self.mic_enabled = True
         self.voice_enabled = True
-        self.speech_module = None
-        self.speaking = threading.Event()
-        self.speech_lock = threading.Lock()
+        self.busy = False
         self.command_lock = threading.Lock()
+        self.permission_bridge = PermissionBridge()
+        self.brain = OrbitDeskBrain(permission_request=self.permission_bridge.ask)
+        self.brain.audit_callback = lambda action, result: self.permission_bridge.audit.emit(action, result)
+        self.brain.notify = lambda message: self.message_added.emit("OrbitDesk", message)
+        self.speech_module = None
         self.wake_stop = threading.Event()
         self.wake_thread = None
-        self.wake_listener_active = False
-        self.wake_ready = False
-        self.wake_desired = False
-        self.wake_error = None
-        self.ready_notice_shown = False
-        self.orbitdesk.notify = self.notify_user
+        self.pending_dialog = None
+        self.message_added.connect(self._append_message)
+        self.status_changed.connect(self._set_status)
+        self.wake_changed.connect(self._set_wake_active)
+        self.wake_triggered.connect(self._show_wake)
+        self.permission_announcement.connect(self._announce_permission)
+        self.permission_resolved.connect(self._dismiss_permission_dialog)
+        self.shutdown_requested.connect(self.exit_app)
+        self.permission_bridge.requested.connect(self._show_permission)
+        self.permission_bridge.audit.connect(self._audit_permission)
 
-        # The orb and Tkinter UI share the main thread. Tk periodically pumps
-        # Qt events, avoiding a second GUI thread and keeping orb state updates safe.
+        self.setWindowTitle("OrbitDesk | Jarvis Assistant")
+        self.setMinimumSize(850, 610)
+        self.resize(1080, 740)
+        self.setStyleSheet(APP_STYLE)
+        self._build_ui()
+        self.audio_level_changed.connect(self.waveform.set_audio_level)
+        self._build_tray()
+
         self.orb = OrbitDeskOrb()
-        self.orb.exit_requested.connect(self.close_app)
-        self.root.after(50, self._pump_qt_events)
+        self.orb.dashboard_requested.connect(self.show_dashboard)
+        self.orb.settings_requested.connect(self.show_settings)
+        self.orb.mute_requested.connect(self.toggle_microphone)
+        self.orb.background_requested.connect(self.hide_to_tray)
+        self.orb.exit_requested.connect(self.exit_app)
+        self.message_added.emit("JARVIS", "Systems online. Say ‘Hey Jarvis’ to begin, or add a Jarvis wake model to use the single-word phrase.")
+        self.status_changed.emit("Starting wake word engine…")
+        self.root_timer = QTimer(self)
+        self.root_timer.timeout.connect(self._update_clock)
+        self.root_timer.start(1000)
+        QTimer.singleShot(250, self.start_wake_listener)
+        QTimer.singleShot(1000, self.showMinimized)
 
-        self.mode = tk.StringVar(value="Keyboard + Microphone")
+    def _build_ui(self):
+        center = QWidget()
+        root = QVBoxLayout(center)
+        header = QHBoxLayout()
+        title = QLabel("ORBITDESK  /  JARVIS")
+        title.setStyleSheet("font-size:22px;font-weight:700;color:#00e5ff;letter-spacing:2px")
+        header.addWidget(title)
+        header.addStretch()
+        self.model_label = QLabel(
+            "● CLOUD API FALLBACK · Optional .env keys" if automation.cloud_mode_enabled()
+            else "● LOCAL MODEL · QWEN 2.5:3B"
+        )
+        self.model_label.setStyleSheet("color:#63b6ff")
+        header.addWidget(self.model_label)
+        root.addLayout(header)
 
-        root.title("OrbitDesk | Personal AI")
-        root.geometry("1000x700")
-        root.minsize(680, 480)
-        root.configure(bg=BG)
-        root.protocol("WM_DELETE_WINDOW", self.hide_to_tray)
+        self.status_label = QLabel("● ONLINE")
+        self.status_label.setStyleSheet("color:#00e5ff;padding:7px 0")
+        root.addWidget(self.status_label)
+        self.waveform = Waveform()
+        root.addWidget(self.waveform)
 
-        # Use a consistent Tk scaling value for crisp, readable text.
-        # Windows DPI awareness above handles display scaling where available.
+        self.tabs = QTabWidget()
+        chat_tab = QWidget()
+        chat_layout = QVBoxLayout(chat_tab)
+        self.history = QTextBrowser()
+        self.history.setOpenExternalLinks(True)
+        chat_layout.addWidget(self.history, 1)
+        compose = QHBoxLayout()
+        self.input = QLineEdit()
+        self.input.setPlaceholderText("Ask Jarvis…")
+        self.input.returnPressed.connect(self.send_keyboard)
+        send = QPushButton("Send")
+        send.clicked.connect(self.send_keyboard)
+        compose.addWidget(self.input, 1)
+        compose.addWidget(send)
+        chat_layout.addLayout(compose)
+        controls = QHBoxLayout()
+        self.mic_button = QPushButton("Microphone: On")
+        self.mic_button.clicked.connect(self.toggle_microphone)
+        self.voice_button = QPushButton("Voice: On")
+        self.voice_button.clicked.connect(self.toggle_voice)
+        controls.addWidget(self.mic_button)
+        controls.addWidget(self.voice_button)
+        controls.addStretch()
+        chat_layout.addLayout(controls)
+        self.tabs.addTab(chat_tab, "Dashboard")
+
+        permission_tab = QWidget()
+        permission_layout = QVBoxLayout(permission_tab)
+        permission_layout.addWidget(QLabel("Permission and action audit"))
+        self.audit_list = QListWidget()
+        permission_layout.addWidget(self.audit_list)
+        self.tabs.addTab(permission_tab, "Permissions")
+
+        settings_tab = QWidget()
+        settings_layout = QVBoxLayout(settings_tab)
+        settings_layout.addWidget(QLabel(f"Voice: {VOICE}  ·  Wake phrase: Hey Jarvis (optional single-word Jarvis model supported)"))
+        settings_layout.addWidget(QLabel("Local transcription: faster-whisper base.en, CPU int8"))
+        settings_layout.addWidget(QLabel("Close behaviour: minimize to system tray"))
+        settings_layout.addStretch()
+        self.tabs.addTab(settings_tab, "Settings")
+        root.addWidget(self.tabs, 1)
+        self.setCentralWidget(center)
+
+    def _build_tray(self):
+        self.tray = QSystemTrayIcon(_tray_icon(), self)
+        self.tray.setToolTip("Jarvis is listening")
+        menu = self.tray.contextMenu()
+        if menu is None:
+            from PySide6.QtWidgets import QMenu
+            menu = QMenu(self)
+        menu.addAction("Open Dashboard", self.show_dashboard)
+        menu.addAction("Mute Microphone", self.toggle_microphone)
+        menu.addAction("Run in Background", self.hide_to_tray)
+        menu.addAction("Settings", lambda: (self.show_dashboard(), self.tabs.setCurrentIndex(2)))
+        menu.addSeparator()
+        menu.addAction("Exit", self.exit_app)
+        self.tray.setContextMenu(menu)
+        self.tray.activated.connect(lambda reason: self.show_dashboard() if reason == QSystemTrayIcon.ActivationReason.DoubleClick else None)
+        self.tray.show()
+
+    def _append_message(self, speaker, message):
+        color = "#00e5ff" if speaker in {"JARVIS", "OrbitDesk"} else "#8ab4ff" if speaker == "YOU" else "#ffbd69"
         try:
-            root.tk.call("tk", "scaling", 1.25)
-        except tk.TclError:
-            pass
+            import markdown
+            body = markdown.markdown(str(message), extensions=["fenced_code", "codehilite"])
+        except ImportError:
+            body = html.escape(str(message)).replace("\n", "<br>")
+        self.history.append(f'<p><b style="color:{color}">{speaker}</b></p>{body}')
 
-        self.build_header()
-        self.build_chat()
-        self.build_controls()
-        self.create_tray_icon()
-
-        self.add_message(
-            "OrbitDesk",
-            "Systems online, sir. Say ‘Hey OrbitDesk’ or type a command."
-        )
-
-        self.root.after(0, self.start_wake_listener)
-        self.update_clock()
-
-
-    def create_tray_icon(self):
-        self.tray_icon = QSystemTrayIcon(build_tray_icon(), self.qt_app)
-        self.tray_icon.setToolTip("OrbitDesk — listening for Hey OrbitDesk")
-
-        self.tray_menu = QMenu()
-        show_action = self.tray_menu.addAction("Open OrbitDesk")
-        show_action.triggered.connect(self.show_window)
-        hide_action = self.tray_menu.addAction("Hide to tray")
-        hide_action.triggered.connect(self.hide_to_tray)
-        self.tray_mic_action = self.tray_menu.addAction("Turn microphone off")
-        self.tray_mic_action.triggered.connect(self.toggle_microphone)
-        self.tray_voice_action = self.tray_menu.addAction("Turn voice off")
-        self.tray_voice_action.triggered.connect(self.toggle_voice)
-        self.tray_menu.addSeparator()
-        exit_action = self.tray_menu.addAction("Exit OrbitDesk")
-        exit_action.triggered.connect(self.close_app)
-
-        self.tray_icon.setContextMenu(self.tray_menu)
-        self.tray_icon.activated.connect(self._tray_activated)
-        self.tray_icon.show()
-        self._update_tray_status()
-
-        if not QSystemTrayIcon.isSystemTrayAvailable():
-            self.root.after(0, self.show_window)
-
-    def _update_tray_status(self):
-        if not hasattr(self, "tray_icon"):
+    def _set_status(self, text):
+        if text.casefold().startswith("listening") and (self.busy or is_speaking()):
             return
-        self.tray_mic_action.setText(
-            "Turn microphone off" if self.mic_enabled else "Turn microphone on"
-        )
-        self.tray_voice_action.setText(
-            "Turn voice off" if self.voice_enabled else "Turn voice on"
-        )
-        if self.wake_error:
-            state = "microphone unavailable"
-        elif not self.mic_enabled:
-            state = "microphone off"
-        elif self.mode.get() == "Keyboard Only":
-            state = "keyboard-only mode"
-        elif self.wake_ready:
-            state = "listening for Hey OrbitDesk"
-        else:
-            state = "starting voice listener"
-        self.tray_icon.setToolTip(f"OrbitDesk — {state}")
+        self.status_label.setText("● " + text.upper())
 
-    def _tray_activated(self, reason):
-        if reason in (
-            QSystemTrayIcon.ActivationReason.Trigger,
-            QSystemTrayIcon.ActivationReason.DoubleClick,
-        ):
-            self.show_window()
+    def _set_wake_active(self, active):
+        self.waveform.set_active(active)
 
-    def show_window(self):
+    def _update_clock(self):
+        self.statusBar().showMessage(datetime.datetime.now().strftime("%A, %d %B %Y  ·  %I:%M:%S %p"))
+
+    def _audit_permission(self, action, result):
+        self.audit_list.insertItem(0, f"{datetime.datetime.now():%H:%M:%S}  ·  {action}  ·  {result}")
+
+    def _show_permission(self, request):
+        if self.closing:
+            request["choice"] = "deny"
+            request["event"].set()
+            return
+        self.pending_dialog = PermissionDialog(request, self.permission_bridge, self)
+        self.pending_dialog.show()
+        self.pending_dialog.raise_()
+        self.permission_announcement.emit(request["summary"])
+
+    def _announce_permission(self, summary):
+        phrase = f"Sir, this action requires your permission to {summary}. Should I proceed?"
+        threading.Thread(target=speak, args=(phrase,), name="JarvisPermissionPrompt", daemon=True).start()
+
+    def _dismiss_permission_dialog(self):
+        if self.pending_dialog is not None:
+            self.pending_dialog.resolved = True
+            self.pending_dialog.close()
+            self.pending_dialog = None
+
+    def _show_wake(self):
         if self.closing:
             return
-        self.root.deiconify()
-        self.root.state("normal")
-        self.root.lift()
-        self.root.focus_force()
-
-    def hide_to_tray(self):
-        if not self.closing:
-            self.root.withdraw()
-
-    # ---------- HEADER ----------
-    def build_header(self):
-        header = tk.Frame(self.root, bg=BG)
-        header.pack(fill="x", padx=20, pady=(16, 6))
-
-        tk.Label(
-            header,
-            text="OrbitDesk",
-            font=(FONT, 28, "bold"),
-            fg=RED,
-            bg=BG
-        ).pack(side="left")
-
-        self.status = tk.Label(
-            header,
-            text="● ONLINE",
-            font=(MONO, 11, "bold"),
-            fg=GREEN,
-            bg=BG
-        )
-        self.status.pack(side="right", pady=10)
-
-        self.clock = tk.Label(
-            self.root,
-            text="",
-            font=(MONO, 11, "bold"),
-            fg=GREY,
-            bg=BG
-        )
-        self.clock.pack(anchor="e", padx=24)
-
-        cards = tk.Frame(self.root, bg=BG)
-        cards.pack(fill="x", padx=16, pady=12)
-
-        for title, detail in [
-            ("LOCAL AI", "Qwen 2.5 3B"),
-            ("VOICE OUTPUT", "Edge TTS"),
-            ("INTERFACE", "High-contrast mode"),
-        ]:
-            card = tk.Frame(
-                cards,
-                bg=PANEL,
-                highlightbackground=RED_DARK,
-                highlightthickness=1,
-                padx=12,
-                pady=11
-            )
-            card.pack(side="left", fill="x", expand=True, padx=4)
-
-            tk.Label(
-                card,
-                text=title,
-                bg=PANEL,
-                fg=RED,
-                font=(FONT, 10, "bold")
-            ).pack(anchor="w")
-
-            tk.Label(
-                card,
-                text=detail,
-                bg=PANEL,
-                fg=WHITE,
-                font=(FONT, 11, "bold")
-            ).pack(anchor="w", pady=(5, 0))
-
-    # ---------- CHAT ----------
-    def build_chat(self):
-        frame = tk.Frame(
-            self.root,
-            bg=RED,
-            highlightbackground=RED,
-            highlightthickness=1
-        )
-        frame.pack(
-            side="top",
-            fill="both",
-            expand=True,
-            padx=20,
-            pady=(0, 10)
-        )
-
-        self.chat = scrolledtext.ScrolledText(
-            frame,
-            wrap=tk.WORD,
-            state="disabled",
-            font=(MONO, 11),
-            bg="#0C0C0C",
-            fg=WHITE,
-            insertbackground=RED,
-            selectbackground=RED_DARK,
-            selectforeground=WHITE,
-            relief="flat",
-            padx=14,
-            pady=14,
-            borderwidth=0,
-            spacing1=3,
-            spacing3=7
-        )
-        self.chat.pack(fill="both", expand=True)
-
-        self.chat.tag_config(
-            "user", foreground="#FF7777",
-            font=(MONO, 11, "bold")
-        )
-        self.chat.tag_config(
-            "orbitdesk", foreground="#FF4545",
-            font=(MONO, 11, "bold")
-        )
-        self.chat.tag_config(
-            "system", foreground=GREY,
-            font=(FONT, 10, "bold")
-        )
-
-    def add_message(self, sender, message):
-        if self.closing:
+        if self.busy or is_speaking():
             return
-
-        timestamp = datetime.datetime.now().strftime("%H:%M:%S")
-
-        if sender == "YOU":
-            tag = "user"
-        elif sender == "OrbitDesk":
-            tag = "orbitdesk"
-        else:
-            tag = "system"
-
-        self.chat.configure(state="normal")
-        self.chat.insert(
-            tk.END, f"[{timestamp}] {sender}: ", tag
-        )
-        self.chat.insert(tk.END, f"{message}\n\n")
-        self.chat.configure(state="disabled")
-        self.chat.see(tk.END)
-
-    # ---------- CONTROLS ----------
-    def build_controls(self):
-        bottom = tk.Frame(self.root, bg=BG)
-        bottom.pack(side="bottom", fill="x", padx=20, pady=(0, 14))
-
-        mode_row = tk.Frame(bottom, bg=BG)
-        mode_row.pack(fill="x", pady=(0, 9))
-
-        tk.Label(
-            mode_row,
-            text="INPUT MODE",
-            font=(FONT, 10, "bold"),
-            fg=RED,
-            bg=BG
-        ).pack(side="left", padx=(0, 10))
-
-        self.mode_menu = tk.OptionMenu(
-            mode_row,
-            self.mode,
-            "Keyboard Only",
-            "Microphone Only",
-            "Keyboard + Microphone",
-            command=self.change_mode
-        )
-        self.mode_menu.configure(
-            bg=PANEL2,
-            fg=WHITE,
-            activebackground=RED_DARK,
-            activeforeground=WHITE,
-            highlightthickness=1,
-            highlightbackground=RED_DARK,
-            relief="flat",
-            font=(FONT, 10, "bold"),
-            width=22
-        )
-        self.mode_menu["menu"].configure(
-            bg=PANEL2,
-            fg=WHITE,
-            activebackground=RED,
-            activeforeground=WHITE,
-            font=(FONT, 10)
-        )
-        self.mode_menu.pack(side="left")
-
-        self.mic_button = tk.Button(
-            mode_row,
-            text="MIC ON",
-            command=self.toggle_microphone,
-            bg=RED_DARK,
-            fg=WHITE,
-            activebackground=RED,
-            activeforeground=WHITE,
-            relief="flat",
-            font=(FONT, 10, "bold"),
-            padx=13,
-            pady=6
-        )
-        self.mic_button.pack(side="left", padx=8)
-
-        self.voice_button = tk.Button(
-            mode_row,
-            text="VOICE ON",
-            command=self.toggle_voice,
-            bg="#292929",
-            fg=GREEN,
-            activebackground="#3A3A3A",
-            activeforeground=WHITE,
-            relief="flat",
-            font=(FONT, 10, "bold"),
-            padx=13,
-            pady=6
-        )
-        self.voice_button.pack(side="left", padx=2)
-
-        self.input_status = tk.Label(
-            mode_row,
-            text="Keyboard ready",
-            fg=GREY,
-            bg=BG,
-            font=(FONT, 10, "bold")
-        )
-        self.input_status.pack(side="right")
-
-        entry_row = tk.Frame(bottom, bg=BG)
-        entry_row.pack(fill="x")
-
-        self.entry = tk.Entry(
-            entry_row,
-            font=(FONT, 13),
-            bg=PANEL,
-            fg=WHITE,
-            insertbackground=RED,
-            relief="flat",
-            disabledbackground="#101010",
-            disabledforeground=GREY,
-            highlightthickness=1,
-            highlightbackground="#555555",
-            highlightcolor=RED
-        )
-        self.entry.pack(
-            side="left",
-            fill="x",
-            expand=True,
-            ipady=12,
-            padx=(0, 8)
-        )
-        self.entry.bind(
-            "<Return>",
-            lambda event: self.send_keyboard()
-        )
-
-        self.send_button = tk.Button(
-            entry_row,
-            text="SEND  ➤",
-            command=self.send_keyboard,
-            bg=RED_DARK,
-            fg=WHITE,
-            activebackground=RED,
-            activeforeground=WHITE,
-            relief="flat",
-            font=(FONT, 10, "bold"),
-            padx=18,
-            pady=10
-        )
-        self.send_button.pack(side="left", padx=(0, 8))
-
-        self.apply_mode()
-
-    def change_mode(self, selected=None):
-        self.apply_mode()
-        if self._should_listen_for_wake_word():
-            self.start_wake_listener()
-        else:
-            self.stop_wake_listener()
-        self._update_tray_status()
-
-    def apply_mode(self):
-        if self.closing:
-            return
-
-        selected = self.mode.get()
-        keyboard_allowed = selected in (
-            "Keyboard Only",
-            "Keyboard + Microphone"
-        )
-        self.entry.configure(
-            state="normal" if keyboard_allowed else "disabled"
-        )
-        self.send_button.configure(
-            state=(
-                "normal"
-                if keyboard_allowed and not self.busy
-                else "disabled"
-            )
-        )
-        if not self.mic_enabled:
-            label = "Microphone disabled"
-        elif selected == "Keyboard Only":
-            label = "Keyboard ready"
-        elif self.wake_error:
-            label = "Microphone unavailable"
-        elif self.wake_ready:
-            label = "Wake word active — say Hey OrbitDesk"
-        elif selected == "Microphone Only":
-            label = "Loading voice model..."
-        else:
-            label = "Loading voice model..."
-
-        self.input_status.configure(text=label)
-
-    def toggle_microphone(self):
-        if self.busy:
-            return
-
-        self.mic_enabled = not self.mic_enabled
-
-        if self.mic_enabled:
-            self.mic_button.configure(text="MIC ON", bg=RED_DARK)
-            self.add_message("SYSTEM", "Microphone input enabled.")
-        else:
-            self.mic_button.configure(text="MIC OFF", bg="#292929")
-            self.add_message("SYSTEM", "Microphone input disabled.")
-
-        if self._should_listen_for_wake_word():
-            self.start_wake_listener()
-        else:
-            self.stop_wake_listener()
-        self.apply_mode()
-        self._update_tray_status()
-
-    def toggle_voice(self):
-        self.voice_enabled = not self.voice_enabled
-
-        if self.voice_enabled:
-            self.voice_button.configure(
-                text="VOICE ON", fg=GREEN
-            )
-            self.add_message("SYSTEM", "Spoken responses enabled.")
-        else:
-            self.voice_button.configure(
-                text="VOICE OFF", fg="#FF7777"
-            )
-            self.add_message(
-                "SYSTEM",
-                "Spoken responses disabled. Text replies remain available."
-            )
-        self._update_tray_status()
-
-    # ---------- KEYBOARD ----------
-    def send_keyboard(self):
-        if self.busy or self.mode.get() == "Microphone Only":
-            return
-
-        command = self.entry.get().strip()
-        if not command:
-            return
-
-        self.entry.delete(0, tk.END)
-        self.add_message("YOU", command)
-        self.set_busy("PROCESSING")
-
-        threading.Thread(
-            target=self.process_command,
-            args=(command,),
-            daemon=True
-        ).start()
-
-    # ---------- MICROPHONE / WAKE WORD ----------
-    def _should_listen_for_wake_word(self):
-        return (
-            self.mic_enabled
-            and self.mode.get() != "Keyboard Only"
-            and not self.closing
-        )
+        self.orb.request_session("Listening…")
+        self.orb.request_state("Listening")
+        self.status_changed.emit("Listening")
 
     def start_wake_listener(self):
-        if not self._should_listen_for_wake_word():
+        if self.closing or not self.mic_enabled:
             return
-
-        self.wake_desired = True
+        if self.wake_thread and self.wake_thread.is_alive():
+            if self.wake_stop.is_set():
+                QTimer.singleShot(300, self.start_wake_listener)
+            return
         self.wake_stop.clear()
-        self.wake_listener_active = True
-        self.wake_ready = False
-        self.wake_error = None
-        self.apply_mode()
-        self.status.configure(
-            text="● LISTENING" if self.wake_ready else "● LOADING VOICE",
-            fg=GREEN if self.wake_ready else YELLOW,
-        )
-        self.orb.request_hide()
-        self._update_tray_status()
-
-        if self.wake_thread is not None and self.wake_thread.is_alive():
-            return
-
-        self.wake_thread = threading.Thread(
-            target=self._wake_listener_loop,
-            daemon=True,
-        )
+        self.wake_thread = threading.Thread(target=self._wake_loop, name="JarvisWakeWord", daemon=True)
         self.wake_thread.start()
 
-    def stop_wake_listener(self):
-        self.wake_desired = False
-        self.wake_stop.set()
-        self.wake_listener_active = False
-        self.wake_ready = False
-        if not self.closing:
-            self.orb.request_hide()
-            self._update_tray_status()
-            if not self.busy:
-                self.status.configure(text="● ONLINE", fg=GREEN)
-
-    def _wake_phrase_heard(self):
-        if not self.closing:
-            try:
-                self.root.after(0, self.orb.show_session, "I'm listening...")
-            except tk.TclError:
-                pass
-
-    def _wake_listener_ready(self):
-        if self.closing:
-            return
-        self.wake_ready = True
+    def _wake_loop(self):
         try:
-            self.root.after(0, self._show_wake_listener_ready)
-        except tk.TclError:
-            pass
-
-    def _show_wake_listener_ready(self):
-        if self.closing:
-            return
-        self.apply_mode()
-        self.orb.request_hide()
-        if not self.ready_notice_shown:
-            device_name = self.speech_module.get_input_device_name()
-            self.add_message(
-                "SYSTEM",
-                f"Wake-word mic ready: {device_name}. Say ‘Hey OrbitDesk’ to begin."
-            )
-            self.tray_icon.showMessage(
-                "OrbitDesk is ready",
-                "Say ‘Hey OrbitDesk’ to start an interaction.",
-                QSystemTrayIcon.MessageIcon.Information,
-                3000,
-            )
-            self.ready_notice_shown = True
-        self._update_tray_status()
-        if not self.busy:
-            self.status.configure(text="● LISTENING", fg=GREEN)
-
-    def _wake_command_received(self, command):
-        if self.closing:
-            return
-        self.add_message("YOU", command)
-        self.set_busy("PROCESSING")
-        self.orb.request_overlay_text(command)
-        self.orb.request_state("Thinking")
-
-    def _wake_listener_failed(self, error):
-        if self.closing:
-            return
-        self.wake_desired = False
-        self.wake_ready = False
-        self.wake_error = error
-        self.add_message("SYSTEM", f"Microphone error: {error}")
-        self.status.configure(text="● MICROPHONE ERROR", fg=YELLOW)
-        self.orb.request_hide()
-        self.tray_icon.showMessage(
-            "OrbitDesk microphone unavailable",
-            str(error),
-            QSystemTrayIcon.MessageIcon.Warning,
-            5000,
-        )
-        self.apply_mode()
-        self._update_tray_status()
-
-    def _wake_listener_stopped(self):
-        if self.closing:
-            return
-        if self.wake_desired and self._should_listen_for_wake_word():
-            self.start_wake_listener()
-            return
-        self.apply_mode()
-        if not self.busy:
-            if self.wake_error:
-                self.status.configure(text="● MICROPHONE ERROR", fg=YELLOW)
-            else:
-                self.status.configure(text="● ONLINE", fg=GREEN)
-
-    def _wake_listener_loop(self):
-        try:
-            if self.speech_module is None:
-                import speech
-                self.speech_module = speech
-
-            if self.closing or self.wake_stop.is_set():
-                return
-
-            while (
-                self.wake_desired
-                and not self.wake_stop.is_set()
-            ):
-                command = self.speech_module.listen_for_wake_command(
+            import speech
+            self.speech_module = speech
+            while not self.closing and not self.wake_stop.is_set():
+                command = speech.listen_for_wake_command(
                     self.wake_stop,
-                    on_wake=self._wake_phrase_heard,
-                    on_activity=self._wake_activity,
-                    on_ready=self._wake_listener_ready,
+                    on_wake=lambda: self.wake_triggered.emit(),
+                    on_activity=lambda level, _text: self.audio_level_changed.emit(level),
+                    on_ready=lambda: self.status_changed.emit("Listening for Hey Jarvis"),
+                    is_speaking=is_speaking,
+                    on_interrupt=stop_speaking,
                 )
                 if self.wake_stop.is_set() or self.closing:
                     break
-                if not command:
-                    self.root.after(0, self.orb.request_hide)
-                    continue
-                if self.busy:
-                    continue
-
-                self.root.after(0, self._wake_command_received, command)
-                threading.Thread(
-                    target=self.process_command,
-                    args=(command,),
-                    name="OrbitDeskVoiceCommand",
-                    daemon=True,
-                ).start()
-
+                if command:
+                    self.message_added.emit("YOU", command)
+                    threading.Thread(target=self.process_command, args=(command,), name="JarvisCommand", daemon=True).start()
+                else:
+                    self.orb.request_hide()
+                self.wake_changed.emit(False)
         except Exception as error:
-            if not self.closing and self.wake_desired:
-                self.root.after(0, self._wake_listener_failed, str(error))
-        finally:
-            self.wake_listener_active = False
-            self.wake_ready = False
-            if not self.closing:
-                self.root.after(0, self._wake_listener_stopped)
+            logging.exception("Wake listener failed")
+            self.status_changed.emit(f"Microphone unavailable: {error}")
 
-    def _wake_activity(self, rms, transcript):
-        if self.closing:
+    def send_keyboard(self):
+        command = self.input.text().strip()
+        if not command:
             return
-        try:
-            self.root.after(0, self._show_wake_activity, rms, transcript)
-        except tk.TclError:
-            pass
-
-    def _show_wake_activity(self, rms, transcript):
-        if self.closing or self.busy or self.speaking.is_set() or not self.wake_listener_active:
-            return
-
-        threshold = getattr(self.speech_module, "WAKE_RMS_THRESHOLD", 12)
-        if rms < threshold:
-            self.status.configure(text="● MIC QUIET", fg=YELLOW)
-            self.input_status.configure(text="Mic is quiet; check your input device")
-            self.tray_icon.setToolTip("OrbitDesk — microphone is quiet")
-        elif transcript:
-            heard = " ".join(transcript.split())[:24]
-            self.status.configure(text=f"● HEARD: {heard}", fg=GREEN)
-            self.input_status.configure(text="Listening for Hey OrbitDesk")
-            self.tray_icon.setToolTip(f"OrbitDesk — heard: {heard}")
-        else:
-            self.status.configure(text="● HEARING AUDIO", fg=GREEN)
-            self.input_status.configure(text="Listening for Hey OrbitDesk")
-            self.tray_icon.setToolTip("OrbitDesk — hearing audio")
-
-    # ---------- AI / VOICE ----------
-    def set_busy(self, message):
-        self.busy = True
-        self.status.configure(text=f"● {message}", fg=YELLOW)
-        if message.upper() == "LISTENING":
-            self.orb.request_state("Listening")
-        else:
-            self.orb.request_state("Thinking")
-        self.apply_mode()
-
-    def set_ready(self):
-        if self.closing:
-            return
-
-        self.busy = False
-        if self._should_listen_for_wake_word() and self.wake_listener_active:
-            self.status.configure(text="● LISTENING", fg=GREEN)
-            self.orb.request_hide()
-        else:
-            self.status.configure(text="● ONLINE", fg=GREEN)
-            self.orb.request_hide()
-        self.apply_mode()
-        self._update_tray_status()
+        self.input.clear()
+        self.message_added.emit("YOU", command)
+        threading.Thread(target=self.process_command, args=(command,), name="JarvisCommand", daemon=True).start()
 
     def process_command(self, command):
-        with self.command_lock:
-            self._process_command_locked(command)
-
-    def _process_command_locked(self, command):
+        normalized = " ".join(command.casefold().replace(",", " ").replace(".", " ").split())
+        if normalized in {"stop", "stop speaking", "cancel", "be quiet"}:
+            stop_speaking()
+            self.status_changed.emit("Speech interrupted")
+            return
+        if self.permission_bridge.has_pending() and normalized in {"yes", "yes proceed", "allow", "allow once", "always allow", "deny", "no", "cancel"}:
+            choice = "always" if normalized == "always allow" else "once" if normalized in {"yes", "yes proceed", "allow", "allow once"} else "deny"
+            self.permission_bridge.resolve(choice)
+            self.permission_resolved.emit()
+            self.message_added.emit("JARVIS", "Permission approved." if choice != "deny" else "Permission denied.")
+            return
+        if not self.command_lock.acquire(blocking=False):
+            self.message_added.emit("JARVIS", "I’m finishing the current request; please try again shortly.")
+            return
+        self.busy = True
+        self.status_changed.emit("Thinking")
+        self.orb.request_state("Thinking")
+        self.orb.request_overlay_text("Thinking…")
         try:
-            response = self.orbitdesk.respond(command)
-
-            if self.closing:
-                return
-
-            self.root.after(
-                0, self.add_message, "OrbitDesk", response
-            )
-            self.root.after(0, self.orb.request_overlay_text, response)
-            self.root.after(0, self.orb.request_state, "Thinking")
-
-            # Keep the UI busy until speech finishes, so another response
-            # cannot compete for the shared audio player.
-            self.speak_if_enabled(response)
-
+            response = self.brain.respond(command)
+            self.message_added.emit("JARVIS", response)
+            self.orb.request_overlay_text(response)
+            if self.voice_enabled and not self.closing:
+                self.status_changed.emit("Speaking")
+                self.orb.request_state("Speaking")
+                speak(response)
         except Exception as error:
-            if not self.closing:
-                self.root.after(
-                    0, self.add_message,
-                    "SYSTEM", f"Error: {error}"
-                )
+            logging.exception("Command processing failed")
+            self.message_added.emit("SYSTEM", f"Something went wrong: {error}")
         finally:
+            self.busy = False
+            self.command_lock.release()
             if not self.closing:
-                if self.orbitdesk.running:
-                    self.root.after(0, self.set_ready)
+                if not self.brain.running:
+                    self.shutdown_requested.emit()
                 else:
-                    self.wake_desired = False
-                    self.wake_stop.set()
-                    # Leave the farewell visible briefly after speech completes.
-                    self.root.after(
-                        0,
-                        lambda: self.status.configure(
-                            text="● SHUTTING DOWN", fg=YELLOW
-                        ),
-                    )
-                    self.root.after(1200, self.close_app)
+                    self.status_changed.emit("Listening for Hey Jarvis" if self.mic_enabled else "Online")
+                    self.orb.request_hide()
 
-    def speak_async(self, message):
-        if not self.voice_enabled or self.closing:
-            return
+    def toggle_microphone(self):
+        self.mic_enabled = not self.mic_enabled
+        self.mic_button.setText("Microphone: On" if self.mic_enabled else "Microphone: Off")
+        if self.mic_enabled:
+            self.start_wake_listener()
+            self.status_changed.emit("Listening for Hey Jarvis")
+        else:
+            self.wake_stop.set()
+            self.status_changed.emit("Microphone off")
+        self._audit_permission("microphone", "Enabled" if self.mic_enabled else "Disabled")
 
-        threading.Thread(
-            target=self.speak_if_enabled,
-            args=(message,),
-            daemon=True
-        ).start()
+    def toggle_voice(self):
+        self.voice_enabled = not self.voice_enabled
+        self.voice_button.setText("Voice: On" if self.voice_enabled else "Voice: Off")
+        if not self.voice_enabled:
+            stop_speaking()
 
-    def speak_if_enabled(self, message):
-        with self.speech_lock:
-            # Check again after waiting for any earlier speech to finish.
-            if not self.voice_enabled or self.closing:
-                return
+    def show_dashboard(self):
+        self.showNormal()
+        self.raise_()
+        self.activateWindow()
 
-            self.speaking.set()
-            self.orb.request_state("Speaking")
-            try:
-                speak(message)
-            except Exception as error:
-                print("Speech output error:", error)
-            finally:
-                self.speaking.clear()
-                if not self.closing:
-                    if not self.busy:
-                        self.orb.request_hide()
+    def show_settings(self):
+        self.show_dashboard()
+        self.tabs.setCurrentIndex(2)
 
-    def notify_user(self, message):
-        """Forward timer notifications from worker threads to the GUI."""
-        if self.closing:
-            return
-        try:
-            self.root.after(0, self._show_notification, message)
-        except tk.TclError:
-            pass
+    def hide_to_tray(self):
+        self.hide()
+        self.orb.request_hide()
 
-    def _show_notification(self, message):
-        if self.closing:
-            return
-        self.add_message("OrbitDesk", message)
-        self.speak_async(message)
+    def closeEvent(self, event):
+        event.ignore()
+        self.hide_to_tray()
 
-    # ---------- QT EVENT PUMP ----------
-    def _pump_qt_events(self):
-        if self.closing:
-            return
-        self.qt_app.processEvents()
-        if not self.closing:
-            self.root.after(10, self._pump_qt_events)
-
-    # ---------- CLOCK / SHUTDOWN ----------
-    def update_clock(self):
-        if self.closing:
-            return
-
-        now = datetime.datetime.now().strftime(
-            "%d %b %Y  |  %I:%M:%S %p"
-        )
-        self.clock.configure(text=now)
-        self.root.after(1000, self.update_clock)
-
-    def close_app(self):
+    def exit_app(self):
         if self.closing:
             return
         self.closing = True
-        self.orbitdesk.running = False
-        self.wake_desired = False
         self.wake_stop.set()
-        if self.wake_thread is not None and self.wake_thread is not threading.current_thread():
+        self.permission_bridge.resolve("deny")
+        stop_speaking()
+        if self.wake_thread and self.wake_thread is not threading.current_thread():
             self.wake_thread.join(timeout=1.5)
-        try:
-            if hasattr(self, "tray_icon"):
-                self.tray_icon.hide()
-            self.orb.close()
-            self.qt_app.quit()
-        finally:
-            self.root.destroy()
+        self.orb.close()
+        self.tray.hide()
+        self.app.quit()
+
+
+def main():
+    app = QApplication(sys.argv)
+    app.setQuitOnLastWindowClosed(False)
+    app.setStyle("Fusion")
+    window = OrbitDeskWindow(app)
+    app.setStyleSheet(APP_STYLE)
+    sys.exit(app.exec())
 
 
 if __name__ == "__main__":
-    # Create Qt first because the orb is a Qt window. Tk remains the main UI loop;
-    # OrbitDeskGUI pumps Qt events on the same thread for smooth orb animation.
-    qt_app = QApplication.instance() or QApplication([])
-    qt_app.setQuitOnLastWindowClosed(False)
-    root = tk.Tk()
-    app = OrbitDeskGUI(root, qt_app)
-    root.withdraw()
-    root.mainloop()
+    main()

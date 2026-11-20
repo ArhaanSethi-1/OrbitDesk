@@ -22,12 +22,17 @@ if not exist "main.py" (
 )
 
 :: Check Python version
-".venv\Scripts\python.exe" -c "import sys; exit(0 if sys.version_info >= (3,10) else 1)"
+".venv\Scripts\python.exe" -c "import sys; exit(0 if (3,10) <= sys.version_info[:2] <= (3,12) else 1)"
 if errorlevel 1 (
-    echo ERROR: The virtual environment must use Python 3.10 or newer.
+    echo ERROR: The virtual environment must use Python 3.10, 3.11, or 3.12.
     echo Run setup.bat after correcting .venv.
     pause
     exit /b 1
+)
+
+if exist ".orbitdesk_setup.json" (
+    ".venv\Scripts\python.exe" -c "import json; exit(0 if json.load(open('.orbitdesk_setup.json', encoding='utf-8')).get('mode') == 'local' else 1)"
+    if errorlevel 1 goto :launch
 )
 
 :: Check Ollama installation
