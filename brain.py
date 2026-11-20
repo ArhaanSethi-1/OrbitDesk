@@ -77,7 +77,7 @@ BLOCKED_PHRASES = (
 # powershell script" would be refused.
 CONTENT_TASK = re.compile(r"^(?:summari[sz]e|explain|translate|rewrite|make)\b", re.IGNORECASE)
 
-BRAVE_OPENED = "Opening Brave, sir."
+BRAVE_OPENED = "Opening your default browser, sir."
 BROWSER_NAMES = ("brave", "brave browser", "browser", "web browser")
 
 WEBSITES = {
@@ -93,7 +93,7 @@ WEBSITES = {
     "instagram": "https://www.instagram.com",
     "discord": "https://discord.com/app",
     "whatsapp": "https://web.whatsapp.com",
-    "amazon": "https://www.amazon.in",
+    "amazon": "https://www.amazon.com",
     "google drive": "https://drive.google.com",
     "google maps": "https://maps.google.com",
     "stackoverflow": "https://stackoverflow.com",
@@ -287,7 +287,7 @@ def _normalise_command(command):
     """
     text = (command or "").strip().replace("\u2019", "'")
     # Drop a leading wake word: "Hey OrbitDesk, open calculator" -> "open calculator".
-    text = re.sub(r"^(?:hey |ok |okay )?orbitdesk\s*[,.:!]?\s+", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"^(?:(?:hey|ok|okay|hi|hello)\s+)?orbitdesk\s*[,.:!]?\s+", "", text, flags=re.IGNORECASE)
     # Drop trailing punctuation.
     text = re.sub(r"[\s.!?,;]+$", "", text)
     return text
@@ -421,12 +421,12 @@ class OrbitDeskBrain:
         self.running = True
         self.notify = self._print_notification  # the GUI replaces this
         self.ai = LocalAI()
-        self._brave = self._find_brave()
 
         self._timers = {}
         self._timer_counter = 0
         self._timer_lock = threading.Lock()
         self._notes = []
+        self._notes_lock = threading.Lock()
 
         self.routes = self._compile_routes([
             (r"^(exit|quit|shutdown orbitdesk|go offline)$", self._shutdown),
@@ -440,7 +440,8 @@ class OrbitDeskBrain:
             (r"^(system (?:status|info)|battery|cpu|ram|memory usage|how is my (?:pc|laptop|computer))$",
              self._system_status),
             (r"^(?:calculate|calc|compute)\s+(?P<expression>.+)$", self._calculate),
-            (r"^what is (?P<expression>[\d\s.+\-*/%^()]+)$", self._calculate),
+            (r"^(?=.*\b(?:plus|minus|times|over|divided by|multiplied by)\b)(?P<expression>[\d\w\s().,+\-*/%^]+)$", self._calculate),
+            (r"^what is (?P<expression>.+)$", self._calculate),
             (r"^convert\s+(?P<amount>-?[\d.]+)\s+(?P<unit_from>[a-z]+)\s+(?:to|in)\s+(?P<unit_to>[a-z]+)$",
              self._convert),
             (r"^(?:set\s+)?(?:a\s+)?timer\s+(?:for\s+)?(?P<amount>[\d.]+)\s+(?P<unit>[a-z]+)$",
@@ -526,9 +527,15 @@ class OrbitDeskBrain:
         return "I am OrbitDesk, your personal assistant, running locally on this laptop."
 
     def _time(self, _match):
+        decision, reason = authorize("tell_time")
+        if decision != Decision.ALLOW:
+            return reason
         return f"The current time is {datetime.datetime.now():%I:%M %p}, sir."
 
     def _date(self, _match):
+        decision, reason = authorize("tell_date")
+        if decision != Decision.ALLOW:
+            return reason
         return f"Today is {datetime.datetime.now():%A, %d %B %Y}, sir."
 
     def _help(self, _match):
@@ -578,7 +585,12 @@ class OrbitDeskBrain:
         if decision != Decision.ALLOW:
             return reason
 
-        expression = match.group("expression").strip()
+        expression = match.group("expression").strip().lower()
+        expression = re.sub(r"\b(plus|added to)\b", "+", expression)
+        expression = re.sub(r"\b(minus|subtract(?:ed)?(?: by| from)?)\b", "-", expression)
+        expression = re.sub(r"\b(times|multiplied by|multiply by)\b", "*", expression)
+        expression = re.sub(r"\b(divided by|over)\b", "/", expression)
+        expression = re.sub(r"\s+", " ", expression).strip()
         try:
             result = safe_eval(expression)
         except (ValueError, SyntaxError, ZeroDivisionError, OverflowError, TypeError):
@@ -692,14 +704,18 @@ class OrbitDeskBrain:
         if decision != Decision.ALLOW:
             return reason
 
-        self._notes.append(match.group("text").strip())
-        return f"Noted, sir. You have {len(self._notes)} note(s)."
+        with self._notes_lock:
+            self._notes.append(match.group("text").strip())
+            count = len(self._notes)
+        return f"Noted, sir. You have {count} note(s)."
 
     def _show_notes(self, _match):
-        if not self._notes:
+        with self._notes_lock:
+            notes = list(self._notes)
+        if not notes:
             return "You have no notes, sir."
         return "Your notes: " + "; ".join(
-            f"{number}. {note}" for number, note in enumerate(self._notes, 1)
+            f"{number}. {note}" for number, note in enumerate(notes, 1)
         ) + "."
 
     def _clear_notes(self, _match):
@@ -707,7 +723,8 @@ class OrbitDeskBrain:
         if decision != Decision.ALLOW:
             return reason
 
-        self._notes.clear()
+        with self._notes_lock:
+            self._notes.clear()
         return "Notes cleared, sir."
 
     # ---------- AI TASKS ----------
@@ -737,17 +754,9 @@ class OrbitDeskBrain:
 
     # ---------- WEB ----------
 
-    def _find_brave(self):
-        candidates = [
-            os.path.join(os.environ.get("PROGRAMFILES", ""), "BraveSoftware", "Brave-Browser", "Application", "brave.exe"),
-            os.path.join(os.environ.get("PROGRAMFILES(X86)", ""), "BraveSoftware", "Brave-Browser", "Application", "brave.exe"),
-            os.path.join(os.environ.get("LOCALAPPDATA", ""), "BraveSoftware", "Brave-Browser", "Application", "brave.exe"),
-        ]
-        return next((path for path in candidates if os.path.isfile(path)), None)
-
     def open_brave(self, url=None):
         if url is None:
-            decision, reason = authorize("open_approved_app", target="brave")
+            decision, reason = authorize("open_approved_app", target="browser")
         else:
             if not _is_safe_https(url):
                 return "That web address isn't permitted, sir."
@@ -757,14 +766,8 @@ class OrbitDeskBrain:
             return reason
 
         try:
-            if self._brave:
-                subprocess.Popen([self._brave] + ([url] if url else []))
-                return BRAVE_OPENED
-            if url:
-                if webbrowser.open(url):
-                    return "I couldn't find Brave, sir, so I've opened the page in your default browser."
-                return "I couldn't launch a browser, sir."
-            return "I couldn't find Brave, sir. Please check that it is installed."
+            webbrowser.open(url or "about:blank")
+            return BRAVE_OPENED
         except OSError:
             return "I couldn't launch the browser, sir."
 
@@ -866,7 +869,7 @@ class OrbitDeskBrain:
         if folder is None:
             return f"I couldn't find your {name} folder, sir."
 
-        decision, reason = authorize("open_approved_folder", target=str(folder))
+        decision, reason = authorize("open_approved_folder", target=name)
         if decision != Decision.ALLOW:
             return reason
 

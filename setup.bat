@@ -8,21 +8,21 @@ echo         OrbitDesk - Initial Setup
 echo ========================================
 echo.
 
-:: Check for the Python launcher
+:: Prefer the Python launcher, but support installations with python.exe only.
 where py >nul 2>&1
 if errorlevel 1 (
-    echo ERROR: Python launcher 'py' was not found.
-    echo Install Python 3.10 from https://www.python.org/downloads/
-    echo Enable the Python launcher during installation.
-    pause
-    exit /b 1
+    where python >nul 2>&1
+    if errorlevel 1 (
+        echo ERROR: Python 3 was not found. Install Python 3.10 or newer.
+        pause
+        exit /b 1
+    )
+    python -c "import sys; exit(0 if sys.version_info >= (3,10) else 1)"
+) else (
+    py -3 -c "import sys; exit(0 if sys.version_info >= (3,10) else 1)"
 )
-
-:: Check for Python 3.10
-py -3.10 --version
 if errorlevel 1 (
-    echo ERROR: Python 3.10 is required.
-    echo Install Python 3.10 and run setup.bat again.
+    echo ERROR: Python 3.10 or newer is required.
     pause
     exit /b 1
 )
@@ -43,14 +43,19 @@ if not exist "main.py" (
 :: Create virtual environment if needed
 if not exist ".venv\Scripts\python.exe" (
     echo Creating Python virtual environment...
-    py -3.10 -m venv .venv
+    where py >nul 2>&1
+    if not errorlevel 1 (
+        py -3 -m venv .venv
+    ) else (
+        python -m venv .venv
+    )
     if errorlevel 1 goto :error
 )
 
 :: Verify virtual environment Python version
-".venv\Scripts\python.exe" -c "import sys; exit(0 if sys.version_info[:2] == (3,10) else 1)"
+".venv\Scripts\python.exe" -c "import sys; exit(0 if sys.version_info >= (3,10) else 1)"
 if errorlevel 1 (
-    echo ERROR: Existing .venv does not use Python 3.10.
+    echo ERROR: Existing .venv does not use Python 3.10 or newer.
     echo Rename or remove .venv, then run setup.bat again.
     goto :error
 )

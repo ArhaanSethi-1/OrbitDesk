@@ -14,6 +14,7 @@ disables the feature. test_safeguards.py checks this automatically.
 
 from pathlib import Path
 from enum import Enum
+import urllib.parse
 
 
 # ---------- CONFIGURATION ----------
@@ -32,8 +33,7 @@ WRITABLE_DIRS = [
 ]
 
 # These actions are permitted without asking each time.
-# NOTE: for these actions authorize() does not inspect `target`; brain.py is
-# responsible for validating targets (app whitelist, https-only URLs, etc.).
+# Opening actions validate their targets against the explicit whitelists below.
 ALWAYS_ALLOWED = {
     "answer_question",
     "tell_time",
@@ -73,6 +73,23 @@ ALWAYS_BLOCKED = {
     "modify_safeguards",
     "grant_self_permissions",
     "run_unknown_program",
+}
+
+APPROVED_APPS = {
+    "browser", "brave", "brave browser", "notepad", "calculator", "paint", "task manager",
+    "file explorer", "explorer", "control panel", "snipping tool", "settings",
+    "vs code", "vscode",
+}
+APPROVED_FOLDERS = {
+    "project", "desktop", "downloads", "documents", "pictures", "music", "videos",
+}
+APPROVED_WEBSITE_HOSTS = {
+    "youtube.com", "www.youtube.com", "google.com", "www.google.com",
+    "mail.google.com", "reddit.com", "www.reddit.com", "github.com",
+    "chatgpt.com", "www.wikipedia.org", "en.wikipedia.org", "open.spotify.com",
+    "www.netflix.com", "www.instagram.com", "discord.com", "web.whatsapp.com",
+    "www.amazon.com", "drive.google.com", "maps.google.com", "stackoverflow.com",
+    "www.twitch.tv",
 }
 
 
@@ -125,6 +142,29 @@ def authorize(action, target=None, approved=False):
 
     if action in ALWAYS_BLOCKED:
         return Decision.BLOCK, f"Blocked by security policy: {action}"
+
+    if action == "open_approved_app":
+        if str(target or "").strip().casefold() not in APPROVED_APPS:
+            return Decision.BLOCK, "The requested app is not on the approved list."
+        return Decision.ALLOW, "Allowed approved app."
+
+    if action == "open_approved_folder":
+        normalized = str(target or "").strip().casefold()
+        if normalized not in APPROVED_FOLDERS:
+            return Decision.BLOCK, "The requested folder is not on the approved list."
+        return Decision.ALLOW, "Allowed approved folder."
+
+    if action == "open_approved_website":
+        try:
+            parsed = urllib.parse.urlparse(str(target or ""))
+            hostname = (parsed.hostname or "").casefold()
+        except ValueError:
+            hostname = ""
+            parsed = None
+        if (parsed is None or parsed.scheme != "https" or hostname not in APPROVED_WEBSITE_HOSTS
+                or parsed.username or parsed.password):
+            return Decision.BLOCK, "The requested website is not on the approved list."
+        return Decision.ALLOW, "Allowed approved website."
 
     if action in ALWAYS_ALLOWED:
         return Decision.ALLOW, f"Allowed by policy: {action}"

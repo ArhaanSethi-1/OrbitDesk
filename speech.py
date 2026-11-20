@@ -68,9 +68,20 @@ def _select_input_device():
 
 MIC_DEVICE = _select_input_device()
 
-print("Loading Whisper model...")
-model = whisper.load_model(MODEL_NAME)
-print("OrbitDesk speech recognition is ready, sir.")
+model = None
+_model_lock = threading.Lock()
+
+
+def _get_model():
+    """Load Whisper only when microphone recognition is first used."""
+    global model
+    if model is None:
+        with _model_lock:
+            if model is None:
+                print("Loading Whisper model...")
+                model = whisper.load_model(MODEL_NAME)
+                print("OrbitDesk speech recognition is ready, sir.")
+    return model
 
 
 def _capture_command(stop_event, initial_noise_floor=30.0):
@@ -117,9 +128,15 @@ def _capture_command(stop_event, initial_noise_floor=30.0):
         device=MIC_DEVICE,
         blocksize=INPUT_BLOCK_FRAMES,
         callback=capture,
-    ):
-        while not complete.wait(0.1) and not stop_event.is_set():
-            pass
+    ) as stream:
+        try:
+            while not complete.wait(0.1) and not stop_event.is_set():
+                pass
+        finally:
+            try:
+                stream.stop()
+            except Exception:
+                pass
 
     if stop_event.is_set() or not chunks:
         return None
@@ -127,14 +144,17 @@ def _capture_command(stop_event, initial_noise_floor=30.0):
 
 
 def _transcribe(audio):
-    samples = audio.reshape(-1).astype(np.float32) / 32768.0
+    raw_samples = np.asarray(audio).reshape(-1).astype(np.float32)
+    if not len(raw_samples) or float(np.sqrt(np.mean(raw_samples * raw_samples))) < VOICE_RMS_THRESHOLD:
+        return ""
+    samples = raw_samples / 32768.0
     audio_blocks = _audio_block_levels(samples, ACTIVITY_BLOCK_FRAMES)
     if len(audio_blocks):
         speech_level = float(np.percentile(audio_blocks, 90))
         gain = min(40.0, 0.08 / max(speech_level, 0.001))
         if gain > 1.0:
             samples = np.clip(samples * gain, -1.0, 1.0)
-    result = model.transcribe(
+    result = _get_model().transcribe(
         samples,
         fp16=False,
         language="en",
@@ -200,43 +220,49 @@ def listen_for_wake_command(stop_event, on_wake=None, on_activity=None, on_ready
         device=MIC_DEVICE,
         blocksize=INPUT_BLOCK_FRAMES,
         callback=capture,
-    ):
+    ) as stream:
         if on_ready is not None:
             on_ready()
-        while not stop_event.is_set():
-            time.sleep(0.1)
-            with buffer_lock:
-                if buffered_frames < max_frames:
-                    continue
-                if total_frames - last_check_frames < check_interval:
-                    continue
-                last_check_frames = total_frames
-                audio = np.concatenate(tuple(audio_chunks), axis=0)[-max_frames:]
+        try:
+            while not stop_event.is_set():
+                time.sleep(0.1)
+                with buffer_lock:
+                    if buffered_frames < max_frames:
+                        continue
+                    if total_frames - last_check_frames < check_interval:
+                        continue
+                    last_check_frames = total_frames
+                    audio = np.concatenate(tuple(audio_chunks), axis=0)[-max_frames:]
 
-            samples = audio.reshape(-1).astype(np.float32)
-            block_rms = _audio_block_levels(samples, ACTIVITY_BLOCK_FRAMES)
-            rms = float(np.max(block_rms)) if len(block_rms) else 0.0
-            if on_activity is not None:
-                on_activity(rms, "")
-            if not len(block_rms):
-                continue
-            estimated_noise = float(np.percentile(block_rms, 25))
-            noise_floor = 0.5 * noise_floor + 0.5 * estimated_noise
-            threshold = max(WAKE_RMS_THRESHOLD, noise_floor * 1.25)
-            voiced_blocks = int(np.count_nonzero(block_rms >= threshold))
-            if voiced_blocks < 2:
-                continue
+                samples = audio.reshape(-1).astype(np.float32)
+                block_rms = _audio_block_levels(samples, ACTIVITY_BLOCK_FRAMES)
+                rms = float(np.max(block_rms)) if len(block_rms) else 0.0
+                if on_activity is not None:
+                    on_activity(rms, "")
+                if not len(block_rms):
+                    continue
+                estimated_noise = float(np.percentile(block_rms, 25))
+                noise_floor = 0.5 * noise_floor + 0.5 * estimated_noise
+                threshold = max(WAKE_RMS_THRESHOLD, noise_floor * 1.25)
+                voiced_blocks = int(np.count_nonzero(block_rms >= threshold))
+                if voiced_blocks < 2:
+                    continue
 
-            transcript = _transcribe(audio)
-            with buffer_lock:
-                last_check_frames = total_frames
-            if stop_event.is_set():
-                return None
-            if on_activity is not None:
-                on_activity(rms, transcript)
-            wake_command = _command_after_wake(transcript)
-            if wake_command is not None:
-                break
+                transcript = _transcribe(audio)
+                with buffer_lock:
+                    last_check_frames = total_frames
+                if stop_event.is_set():
+                    return None
+                if on_activity is not None:
+                    on_activity(rms, transcript)
+                wake_command = _command_after_wake(transcript)
+                if wake_command is not None:
+                    break
+        finally:
+            try:
+                stream.stop()
+            except Exception:
+                pass
 
     if stop_event.is_set() or wake_command is None:
         return None
@@ -279,7 +305,7 @@ def listen():
 
         print("Transcribing your speech...")
 
-        result = model.transcribe(
+        result = _get_model().transcribe(
             audio_path,
             fp16=False,
             language="en"

@@ -6,6 +6,28 @@ import safeguards
 
 
 class SafeguardPolicyTests(unittest.TestCase):
+    def test_every_always_allowed_action_is_checked(self):
+        targeted_cases = {
+            "open_approved_app": "calculator",
+            "open_approved_folder": "project",
+            "open_approved_website": "https://www.google.com",
+        }
+        for action in safeguards.ALWAYS_ALLOWED:
+            with self.subTest(action=action):
+                decision, _ = safeguards.authorize(action, target=targeted_cases.get(action))
+                self.assertEqual(decision, safeguards.Decision.ALLOW)
+
+    def test_approved_open_actions_reject_unlisted_targets(self):
+        cases = (
+            ("open_approved_app", "powershell"),
+            ("open_approved_folder", "system32"),
+            ("open_approved_website", "https://example.invalid"),
+        )
+        for action, target in cases:
+            with self.subTest(action=action):
+                decision, _ = safeguards.authorize(action, target=target)
+                self.assertEqual(decision, safeguards.Decision.BLOCK)
+
     def test_brain_authorize_calls_are_classified(self):
         source = Path(__file__).with_name("brain.py").read_text(encoding="utf-8")
         tree = ast.parse(source)

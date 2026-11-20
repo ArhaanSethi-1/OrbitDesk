@@ -22,9 +22,9 @@ if not exist "main.py" (
 )
 
 :: Check Python version
-".venv\Scripts\python.exe" -c "import sys; exit(0 if sys.version_info[:2] == (3,10) else 1)"
+".venv\Scripts\python.exe" -c "import sys; exit(0 if sys.version_info >= (3,10) else 1)"
 if errorlevel 1 (
-    echo ERROR: The virtual environment must use Python 3.10.
+    echo ERROR: The virtual environment must use Python 3.10 or newer.
     echo Run setup.bat after correcting .venv.
     pause
     exit /b 1
@@ -70,6 +70,7 @@ if errorlevel 1 (
 
 :launch
 echo Launching OrbitDesk in the system tray...
+echo Diagnostics are written to %LOCALAPPDATA%\OrbitDesk\logs\orbitdesk.log.
 echo.
 
 if exist ".venv\Scripts\pythonw.exe" (

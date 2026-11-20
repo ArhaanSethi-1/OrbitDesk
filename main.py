@@ -1,16 +1,61 @@
 
-# pythonw.exe has no console streams. Keep status prints harmless when OrbitDesk
-# starts quietly in the system tray.
+# Keep diagnostics available when OrbitDesk starts with pythonw.exe.
 import os
 import sys
+import threading
+import logging
+from logging.handlers import RotatingFileHandler
 
-_null_output = None
-if sys.stdout is None or sys.stderr is None:
-    _null_output = open(os.devnull, "w", encoding="utf-8")
-    if sys.stdout is None:
-        sys.stdout = _null_output
-    if sys.stderr is None:
-        sys.stderr = _null_output
+_log_dir = os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), "OrbitDesk", "logs")
+try:
+    os.makedirs(_log_dir, exist_ok=True)
+    _handler = RotatingFileHandler(os.path.join(_log_dir, "orbitdesk.log"), maxBytes=2_000_000, backupCount=4, encoding="utf-8")
+    logging.basicConfig(level=logging.INFO, handlers=[_handler], format="%(asctime)s %(levelname)s %(threadName)s %(message)s")
+except OSError:
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+
+
+def _log_uncaught_exception(exc_type, exc_value, exc_traceback):
+    if issubclass(exc_type, KeyboardInterrupt):
+        return sys.__excepthook__(exc_type, exc_value, exc_traceback)
+    logging.critical("Uncaught application exception", exc_info=(exc_type, exc_value, exc_traceback))
+
+
+sys.excepthook = _log_uncaught_exception
+
+
+def _log_thread_exception(args):
+    logging.critical(
+        "Uncaught exception in thread %s", args.thread.name if args.thread else "unknown",
+        exc_info=(args.exc_type, args.exc_value, args.exc_traceback),
+    )
+
+
+threading_excepthook = getattr(threading, "excepthook", None)
+if threading_excepthook is not None:
+    threading.excepthook = _log_thread_exception
+if sys.stdout is None:
+    class _LogStream:
+        def __init__(self, level):
+            self.level = level
+            self._buffer = ""
+
+        def write(self, value):
+            self._buffer += str(value)
+            while "\n" in self._buffer:
+                line, self._buffer = self._buffer.split("\n", 1)
+                if line.strip():
+                    logging.log(self.level, line)
+            return len(value)
+
+        def flush(self):
+            if self._buffer.strip():
+                logging.log(self.level, self._buffer)
+            self._buffer = ""
+
+    sys.stdout = _LogStream(logging.INFO)
+if sys.stderr is None:
+    sys.stderr = _LogStream(logging.ERROR)
 
 # Enable sharper Windows rendering before creating the Tkinter window.
 try:
@@ -21,7 +66,6 @@ except Exception:
 
 import tkinter as tk
 from tkinter import scrolledtext
-import threading
 import datetime
 
 from PySide6.QtCore import Qt
@@ -80,6 +124,7 @@ class OrbitDeskGUI:
         self.speech_module = None
         self.speaking = threading.Event()
         self.speech_lock = threading.Lock()
+        self.command_lock = threading.Lock()
         self.wake_stop = threading.Event()
         self.wake_thread = None
         self.wake_listener_active = False
@@ -700,7 +745,12 @@ class OrbitDeskGUI:
                     continue
 
                 self.root.after(0, self._wake_command_received, command)
-                self.process_command(command)
+                threading.Thread(
+                    target=self.process_command,
+                    args=(command,),
+                    name="OrbitDeskVoiceCommand",
+                    daemon=True,
+                ).start()
 
         except Exception as error:
             if not self.closing and self.wake_desired:
@@ -720,7 +770,7 @@ class OrbitDeskGUI:
             pass
 
     def _show_wake_activity(self, rms, transcript):
-        if self.closing or self.busy or not self.wake_listener_active:
+        if self.closing or self.busy or self.speaking.is_set() or not self.wake_listener_active:
             return
 
         threshold = getattr(self.speech_module, "WAKE_RMS_THRESHOLD", 12)
@@ -763,6 +813,10 @@ class OrbitDeskGUI:
         self._update_tray_status()
 
     def process_command(self, command):
+        with self.command_lock:
+            self._process_command_locked(command)
+
+    def _process_command_locked(self, command):
         try:
             response = self.orbitdesk.respond(command)
 
@@ -870,6 +924,8 @@ class OrbitDeskGUI:
         self.orbitdesk.running = False
         self.wake_desired = False
         self.wake_stop.set()
+        if self.wake_thread is not None and self.wake_thread is not threading.current_thread():
+            self.wake_thread.join(timeout=1.5)
         try:
             if hasattr(self, "tray_icon"):
                 self.tray_icon.hide()
