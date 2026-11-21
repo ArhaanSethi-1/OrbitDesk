@@ -1,66 +1,57 @@
-# OrbitDesk Jarvis
+# OrbitDesk
 
-OrbitDesk is a Windows voice assistant with a PySide6 dashboard, tray controls, a floating Arc Reactor orb, on-device wake detection, local speech transcription, and guarded desktop automation.
+A lightweight Windows voice assistant built with PySide6, on-device wake-word detection, local Faster-Whisper transcription, and local LLM orchestration via Ollama.
 
-## Features
+## Architecture & Features
 
-- OpenWakeWord detection for **Hey Jarvis**, with no Whisper inference during idle listening.
-- Optional custom `jarvis.onnx` wake model for the standalone **Jarvis** phrase. Place it at `%LOCALAPPDATA%\OrbitDesk\models\jarvis.onnx`, or set `JARVIS_SINGLE_WAKE_MODEL` to a model path.
-- Faster Whisper `base.en` transcription on CPU with VAD and silence-based command capture.
-- Edge TTS with an optional SAPI5 offline fallback and interruptible audio playback. Set `JARVIS_VOICE` to select a different Edge voice.
-- PySide6-only dashboard, tray-first startup, visual waveform, animated orb, action audit, and permission dialogs.
-- Dictation into the focused window and explicit prompts to ChatGPT, Claude, or Antigravity.
-- Permission-gated controls for audio, media, brightness, window state, launching Start Menu programs, external AI prompts, and a small read-only terminal diagnostic allowlist.
-- Optional API-key fallback for ChatGPT, Claude, and Gemini-compatible prompts.
+- **Wake Word**: OpenWakeWord for "Hey Jarvis" (idle runs on ONNX without activating Whisper). Optional custom `jarvis.onnx` can be placed at `%LOCALAPPDATA%\OrbitDesk\models\jarvis.onnx` or configured with `JARVIS_SINGLE_WAKE_MODEL`.
+- **Speech-to-Text**: Local CPU transcription using Faster-Whisper (`base.en`) with voice activity detection (VAD).
+- **Text-to-Speech**: Edge TTS streaming audio playback with Windows SAPI5 offline fallback. Configurable via `JARVIS_VOICE`.
+- **Desktop UI**: PySide6 dashboard, system tray integration, audio waveform monitor, and floating status orb.
+- **Local & Cloud LLMs**: Local Ollama backend (`qwen2.5:3b`, `qwen2.5-coder:3b`, `qwen2.5-coder:7b`) with optional OpenAI / Anthropic API fallbacks.
+- **Security & Permissions**: Action allowlists for launching applications, shell diagnostics, media/volume controls, and interactive permission prompts for write operations.
 
-## Install and run
+## Quick Start
 
-Run `setup.bat`. Select one of the setup choices:
+1. Run the setup script:
+   ```cmd
+   setup.bat
+   ```
+2. Launch the assistant:
+   ```cmd
+   run.bat
+   ```
 
-1. **Complete Setup with Local AI** installs dependencies and offers to pull `qwen2.5:3b` through an installed Ollama. The model download is opt-in.
-2. **Lightweight Setup** installs voice and desktop capabilities without downloading a local AI model. Optional cloud keys make general questions use the configured API provider.
-3. **Test Audio & Microphone** installs dependencies and records a short microphone check.
-4. **Exit**.
+OrbitDesk starts minimized to the system tray. Use the hotword **"Hey Jarvis"** or interact directly through the dashboard.
 
-Python 3.10, 3.11, or 3.12 is supported. Once setup completes, run `run.bat`. The application starts minimized to the tray; say “Hey Jarvis” to activate an interaction, or open the dashboard from the tray.
+### Local Model Profiles
 
-### Switching local models
+Under **Settings → AI assistance model**, you can switch between preconfigured profiles:
+- **Fast**: `qwen2.5:3b`
+- **Coding**: `qwen2.5-coder:3b`
+- **Quality**: `qwen2.5-coder:7b`
 
-Open **Settings → AI assistance model**, choose a profile, then select **Download and switch model**. The model is pulled from the already-installed local Ollama service and the choice is saved under `%LOCALAPPDATA%\OrbitDesk\settings.json`. You can also say “Hey Jarvis, switch to coding model”, “switch to fast model”, or “switch to strong model”. Voice requests start the download automatically. OrbitDesk does not install Ollama itself.
+You can also trigger downloads and switches by voice (e.g., *"switch to coding model"*). Ollama must be running locally.
 
-The profiles are Fast (`qwen2.5:3b`), Coding (`qwen2.5-coder:3b`), and Higher quality (`qwen2.5-coder:7b`). The 7B profile may be slow or memory constrained on an 8 GB RAM / 4 GB VRAM PC. It is downloaded only when selected.
+## Configuration (.env)
 
-## Optional API keys
-
-Create a local `.env` file in the project directory. Do not commit it:
+Create a `.env` file in the project root for optional cloud keys and voice settings:
 
 ```dotenv
-OPENAI_API_KEY=...
-ANTHROPIC_API_KEY=...
-GEMINI_API_KEY=...
+OPENAI_API_KEY=your_openai_key
+ANTHROPIC_API_KEY=your_anthropic_key
 JARVIS_VOICE=en-GB-RyanNeural
 ```
 
-The assistant uses these keys only for explicitly requested AI prompts, or for general questions when Lightweight Setup is selected. Sending a prompt to an external AI service requires permission unless that provider was explicitly set to Always Allow.
+## Running Tests
 
-## Command examples
-
-- “Jarvis, type I’ll be there at 3.”
-- “Ask ChatGPT to summarise this paragraph: …”
-- “Prompt Claude with …”
-- “Send to Antigravity …”
-- “Set volume to 30 percent”, “mute volume”, “skip track”, or “set brightness to 60 percent”.
-- “Launch Notepad” or “run command whoami”.
-- “Search the web for …” or “open website example.com”.
-
-Permission-sensitive actions show an Allow Once / Always Allow / Deny prompt and accept a spoken “yes, proceed” or “deny”. Terminal requests are confined to read-only diagnostics and do not invoke a shell.
-
-## Diagnostics and tests
-
-Application diagnostics use a rotating log at `%LOCALAPPDATA%\OrbitDesk\logs\orbitdesk.log`.
-
-Run the tests with:
+Run the test suite using pytest or unittest:
 
 ```powershell
-python -m unittest discover -v
+python -m unittest discover tests
+```
+
+To install development dependencies:
+```powershell
+pip install -e ".[dev]"
 ```

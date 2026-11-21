@@ -79,7 +79,7 @@ def main():
                 if result:
                     print("Model download failed; retry later with: ollama pull qwen2.5:3b")
     elif choice == "2":
-        print("Lightweight setup selected. Add OPENAI_API_KEY, ANTHROPIC_API_KEY, or GEMINI_API_KEY to .env for API prompts.")
+        print("Lightweight setup selected. Add OPENAI_API_KEY or ANTHROPIC_API_KEY to .env for API prompts.")
     else:
         return test_audio()
 

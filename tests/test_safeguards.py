@@ -4,7 +4,7 @@ import unittest
 import tempfile
 from unittest.mock import patch
 
-import safeguards
+from orbitdesk.core import safeguards
 
 
 class SafeguardPolicyTests(unittest.TestCase):
@@ -51,7 +51,8 @@ class SafeguardPolicyTests(unittest.TestCase):
             self.assertEqual(decision, safeguards.Decision.ALLOW)
 
     def test_brain_authorize_calls_are_classified(self):
-        source = Path(__file__).with_name("brain.py").read_text(encoding="utf-8")
+        source = Path(__file__).parents[1] / "src" / "orbitdesk" / "core" / "brain.py"
+        source = source.read_text(encoding="utf-8")
         tree = ast.parse(source)
         used_actions = set()
 
@@ -86,7 +87,7 @@ class SafeguardPolicyTests(unittest.TestCase):
         self.assertTrue(allowed)
 
     def test_output_path_is_inside_write_boundary(self):
-        output_file = Path(__file__).with_name("output") / "test-result.txt"
+        output_file = Path(__file__).parents[1] / "output" / "test-result.txt"
         allowed, _ = safeguards.check_write_path(output_file)
         self.assertTrue(allowed)
 

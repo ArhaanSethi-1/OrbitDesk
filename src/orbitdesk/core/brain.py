@@ -1,9 +1,4 @@
-"""
-OrbitDesk brain: routes commands to built-in tools or to the local Qwen model.
-
-Every action that touches the computer goes through safeguards.authorize().
-OrbitDesk never runs arbitrary commands, deletes files, or closes programs.
-"""
+"""Core command dispatcher, natural language routing, and local model orchestration."""
 
 import ast
 import datetime
@@ -24,26 +19,22 @@ import webbrowser
 from collections import deque
 from pathlib import Path
 
-from safeguards import authorize, Decision
-import automation
-import safeguards
-import model_manager
+from orbitdesk.core.safeguards import authorize, Decision
+from orbitdesk.core import automation, safeguards
+from orbitdesk.models import model_manager
 
 try:
     import psutil
 except ImportError:
     psutil = None
 
-
-# ---------- CONFIGURATION ----------
-
-PROJECT_DIR = Path(__file__).resolve().parent
+PROJECT_DIR = Path(__file__).resolve().parents[3]
 
 OLLAMA_URL = "http://127.0.0.1:11434"
 MODEL = model_manager.PROFILES[model_manager.load_profile()]["model"]
-KEEP_ALIVE = "15m"        # keep Qwen loaded in memory between questions
-MAX_REPLY_TOKENS = 400    # shorter replies come back faster
-HISTORY_TURNS = 8         # question/answer pairs remembered
+KEEP_ALIVE = "15m"
+MAX_REPLY_TOKENS = 400
+HISTORY_TURNS = 8
 MAX_INPUT_CHARS = 4000
 MAX_TIMER_SECONDS = 12 * 3600
 
@@ -56,8 +47,6 @@ SYSTEM_PROMPT = (
     "Never claim you performed an action unless a tool confirms it."
 )
 
-# A courtesy filter that gives a clear refusal. It is NOT the real protection:
-# OrbitDesk has no tool that can run commands or delete files in the first place.
 BLOCKED_PHRASES = (
     "run this command",
     "execute this command",
@@ -75,9 +64,7 @@ BLOCKED_PHRASES = (
     "disable antivirus",
 )
 
-# Commands that carry pasted content (error messages, text to translate...) are
-# exempt from the phrase filter, otherwise "explain error: failed to run
-# powershell script" would be refused.
+# Text transformation tasks exempt from command phrase filters
 CONTENT_TASK = re.compile(r"^(?:summari[sz]e|explain|translate|rewrite|make)\b", re.IGNORECASE)
 
 BRAVE_OPENED = "Opening your default browser, sir."
@@ -91,7 +78,6 @@ WEBSITES = {
     "github": "https://github.com",
     "chatgpt": "https://chatgpt.com",
     "claude": "https://claude.ai",
-    "antigravity": "https://antigravity.google",
     "wikipedia": "https://www.wikipedia.org",
     "spotify": "https://open.spotify.com",
     "netflix": "https://www.netflix.com",
@@ -106,8 +92,8 @@ WEBSITES = {
     "twitch": "https://www.twitch.tv",
 }
 
-# Desktop apps: ("exe", program) runs a program, ("uri", address) uses Windows
-# URI handlers, ("cmd", name) finds a command on PATH such as VS Code's "code".
+# Supported application launch targets: (type, target)
+# type: 'exe' for binary execution, 'uri' for protocol handler, 'cmd' for PATH lookup
 APPS = {
     "notepad": ("exe", "notepad.exe"),
     "calculator": ("exe", "calc.exe"),
@@ -129,11 +115,10 @@ FOLDERS = {
     "pictures": "Pictures",
     "music": "Music",
     "videos": "Videos",
-    "project": None,  # OrbitDesk's own project folder
+    "project": None,
 }
 
-# Windows "known folder" IDs, so folders redirected to OneDrive are found
-# where Windows really keeps them.
+# Known folder GUIDs for shell path resolution
 FOLDER_GUIDS = {
     "desktop": "B4BFCC3A-DB2C-424C-B029-7FE99A87C641",
     "documents": "FDD39AD0-238F-46AF-ADB4-6C85480369C7",
@@ -205,9 +190,6 @@ BIN_OPS = {
     ast.Mod: operator.mod, ast.Pow: operator.pow,
 }
 UNARY_OPS = {ast.USub: operator.neg, ast.UAdd: operator.pos}
-
-
-# ---------- HELPERS ----------
 
 def _checked_pow(left, right):
     """Refuse powers that would take huge amounts of memory or time."""
@@ -284,22 +266,15 @@ def _describe_seconds(seconds):
 
 
 def _normalise_command(command):
-    """
-    Tidy a typed or spoken command before routing.
-
-    Whisper adds capital letters, commas and full stops ("Hello, OrbitDesk.",
-    "Set timer for 10 minutes."), which would otherwise miss the patterns below.
-    """
+    """Normalize input command by stripping wake prefixes and trailing punctuation."""
     text = (command or "").strip().replace("\u2019", "'")
-    # Drop a leading wake word: "Hey Jarvis, open calculator" -> "open calculator".
     text = re.sub(r"^(?:(?:hey|ok|okay|hi|hello)\s+)?(?:orbitdesk|jarvis)\s*[,.:!]?\s+", "", text, flags=re.IGNORECASE)
-    # Drop trailing punctuation.
     text = re.sub(r"[\s.!?,;]+$", "", text)
     return text
 
 
 def _known_folder(name):
-    """Ask Windows where a standard folder really lives. Returns None on any failure."""
+    """Resolve Windows shell known folder path."""
     guid_text = FOLDER_GUIDS.get(name)
     if guid_text is None:
         return None
@@ -330,9 +305,6 @@ def _known_folder(name):
     except Exception:
         return None
 
-
-# ---------- LOCAL AI (QWEN VIA OLLAMA) ----------
-
 class LocalAI:
     def __init__(self, base_url=OLLAMA_URL, model=MODEL):
         self.base_url = base_url
@@ -359,25 +331,23 @@ class LocalAI:
             return json.loads(response.read().decode("utf-8"))
 
     def warm_up(self):
-        """Load the model into memory in the background so the first reply is quicker."""
+        """Warm up the active model in the background."""
         try:
             with self._lock:
                 model = self.model
             self._post("/api/generate", {"model": model, "keep_alive": KEEP_ALIVE}, timeout=300)
         except Exception:
-            pass  # OrbitDesk still works; the first reply will just take longer.
+            pass
 
     def clear(self):
         with self._lock:
             self._history.clear()
 
     def ask(self, text, remember=True):
-        # The lock is held only while reading or writing history, never during the HTTP call.
         with self._lock:
             history = list(self._history)
             model = self.model
 
-        # The model has no clock, so tell it the date and time on every request.
         now = datetime.datetime.now().strftime("%A %d %B %Y, %I:%M %p")
         system_prompt = f"{SYSTEM_PROMPT} The current date and time is {now}."
 
@@ -452,9 +422,6 @@ class LocalAI:
                 self._history.append({"role": "assistant", "content": answer})
         return answer
 
-
-# ---------- BRAIN ----------
-
 class OrbitDeskBrain:
     def __init__(self, warm_up=True, permission_request=None):
         self.running = True
@@ -480,7 +447,6 @@ class OrbitDeskBrain:
              r"|what day is it(?: today)?|what is today)$", self._date),
             (r"^(help|what can you do|show commands|list commands)$", self._help),
             (r"^(?:switch|change|use|select)(?:\s+to)?(?:\s+the)?\s+(?P<profile>fast|faster|light|lightweight|low|coding|code|strong|high|higher|quality)(?:\s+(?:ai\s+)?(?:assistance|model|profile))?$", self._switch_model),
-            (r"^(?:switch|change|use|select)(?:\s+to)?(?:\s+the)?\s+(?P<profile>fast|faster|light|lightweight|low|coding|code|strong|high|higher|quality)(?:\s+(?:ai\s+)?(?:assistance|model|profile))?$", self._switch_model),
             (r"^(system (?:status|info)|battery|cpu|ram|memory usage|how is my (?:pc|laptop|computer))$",
              self._system_status),
             (r"^(?:calculate|calc|compute)\s+(?P<expression>.+)$", self._calculate),
@@ -489,7 +455,6 @@ class OrbitDeskBrain:
             (r"^(?:type|dictate)\s+(?P<text>.+)$", self._type_text),
             (r"^ask chatgpt\s+(?P<prompt>.+)$", self._prompt_chatgpt),
             (r"^prompt claude with\s+(?P<prompt>.+)$", self._prompt_claude),
-            (r"^send to antigravity\s+(?P<prompt>.+)$", self._prompt_antigravity),
             (r"^(?:run|execute) command\s+(?P<command>.+)$", self._run_command),
             (r"^(?:mute|unmute) (?:the )?volume$", self._volume_mute),
             (r"^(?:set )?volume(?: to)? (?P<level>\d{1,3})(?: percent)?$", self._volume_set),
@@ -530,13 +495,11 @@ class OrbitDeskBrain:
             (r"^(?P<verb>open|launch|start)\s+(?P<name>.+)$", self._open_name),
         ])
 
-        # Load Qwen in the background so the first real question is faster.
         if warm_up and model_manager.load_profile() != "strong":
             threading.Thread(target=self.ai.warm_up, daemon=True).start()
 
     @staticmethod
     def _compile_routes(routes):
-        # DOTALL lets pasted multi-line text (error messages...) match ".+".
         flags = re.IGNORECASE | re.DOTALL
         return [(re.compile(pattern, flags), handler) for pattern, handler in routes]
 
@@ -589,9 +552,6 @@ class OrbitDeskBrain:
 
     def _prompt_claude(self, match):
         return self._prompt_ai("claude", match.group("prompt"))
-
-    def _prompt_antigravity(self, match):
-        return self._prompt_ai("antigravity", match.group("prompt"))
 
     def _run_command(self, match):
         command = match.group("command").strip()
@@ -651,8 +611,6 @@ class OrbitDeskBrain:
     def _print_notification(message):
         print(f"\nOrbitDesk: {message}")
 
-    # ---------- ROUTER ----------
-
     def respond(self, command):
         text = _normalise_command(command)
 
@@ -690,8 +648,6 @@ class OrbitDeskBrain:
 
         return self.ai.ask(text)
 
-    # ---------- GENERAL ----------
-
     def _shutdown(self, _match):
         self.running = False
         return "Until next time, sir."
@@ -717,7 +673,7 @@ class OrbitDeskBrain:
     def _help(self, _match):
         return (
             "I can answer questions, search and open websites, dictate text into the focused app, "
-            "send prompts to ChatGPT, Claude or Antigravity, control audio and brightness, "
+            "send prompts to ChatGPT or Claude, control audio and brightness, "
             "launch installed apps, run approved diagnostic commands, calculate, convert units, "
             "set timers and manage notes. Sensitive actions ask for permission first."
         )
@@ -737,8 +693,6 @@ class OrbitDeskBrain:
         if warning:
             return f"I’ll download the {model_manager.PROFILES[profile]['name']} model. {warning}"
         return f"I’ll download and switch to the {model_manager.PROFILES[profile]['name']} model, sir."
-
-    # ---------- SYSTEM ----------
 
     def _system_status(self, _match):
         decision, reason = authorize("system_status")
@@ -764,8 +718,6 @@ class OrbitDeskBrain:
             status = "plugged in" if battery.power_plugged else "on battery"
             parts.append(f"battery at {battery.percent:.0f} percent, {status}")
         return "Status: " + "; ".join(parts) + ", sir."
-
-    # ---------- CALCULATOR AND CONVERTER ----------
 
     def _calculate(self, match):
         decision, reason = authorize("calculate")
@@ -814,8 +766,6 @@ class OrbitDeskBrain:
 
         result = conversion(amount)
         return f"{amount:g} {match.group('unit_from')} is {result:.2f} {match.group('unit_to')}, sir."
-
-    # ---------- TIMERS ----------
 
     def _start_timer(self, seconds, label):
         with self._timer_lock:
@@ -884,8 +834,6 @@ class OrbitDeskBrain:
 
         return f"Cancelled {count} timer(s), sir." if count else "There were no timers to cancel, sir."
 
-    # ---------- NOTES (kept in memory for this session) ----------
-
     def _add_note(self, match):
         decision, reason = authorize("manage_notes")
         if decision != Decision.ALLOW:
@@ -914,8 +862,6 @@ class OrbitDeskBrain:
             self._notes.clear()
         return "Notes cleared, sir."
 
-    # ---------- AI TASKS ----------
-
     def _ai_task(self, template_key, **fields):
         decision, reason = authorize("answer_question")
         if decision != Decision.ALLOW:
@@ -938,8 +884,6 @@ class OrbitDeskBrain:
             language=match.group("language"),
             text=match.group("text"),
         )
-
-    # ---------- WEB ----------
 
     def open_brave(self, url=None):
         if url is None:
@@ -1030,8 +974,6 @@ class OrbitDeskBrain:
         url = "https://en.wikipedia.org/w/index.php?search=" + urllib.parse.quote_plus(query)
         return self._browse(url, f"Searching Wikipedia for {query}, sir.")
 
-    # ---------- OPENING APPS AND FOLDERS ----------
-
     def open_app(self, name):
         if name not in APPS:
             return None
@@ -1101,12 +1043,10 @@ class OrbitDeskBrain:
         if name in BROWSER_NAMES:
             return self.open_brave()
 
-        # "open the calculator app" / "open my downloads folder"
         name = re.sub(r"\s+(?:folder|app|application|program|website|site|browser)$", "", name)
         if name == "brave":
             return self.open_brave()
 
-        # Try each opener in turn and stop at the first one that knows the name.
         for opener in (self.open_app, self.open_folder, self.open_website):
             result = opener(name)
             if result is not None:
@@ -1126,14 +1066,13 @@ class OrbitDeskBrain:
         if verb in ("open", "launch"):
             return f"I don't have a shortcut for {name}, sir."
 
-        return None  # "start learning Python" is a question for the AI.
+        return None
 
 
 if __name__ == "__main__":
-    # Keyboard test without the GUI: py -3.10 brain.py
     orbitdesk = OrbitDeskBrain()
 
-    print("OrbitDesk BRAIN TEST")
+    print("OrbitDesk Interactive Shell")
     print("Type 'help' for commands or 'exit' to quit.")
 
     while orbitdesk.running:
@@ -1141,5 +1080,5 @@ if __name__ == "__main__":
             user_command = input("\nYou: ")
             print(f"OrbitDesk: {orbitdesk.respond(user_command)}")
         except (KeyboardInterrupt, EOFError):
-            print("\nOrbitDesk: Until next time, sir.")
+            print("\nOrbitDesk: Exiting.")
             break

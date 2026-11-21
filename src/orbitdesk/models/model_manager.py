@@ -24,8 +24,8 @@ PROFILES = {
     "strong": {
         "name": "Higher quality (slow)",
         "model": "qwen2.5-coder:7b",
-        "description": "Larger code model, about 4.7 GB to download.",
-        "warning": "This model is larger than your 4 GB VRAM and may run slowly or use Windows paging with 8 GB RAM.",
+        "description": "7B code model, about 4.7 GB to download; it needs more runtime memory than smaller profiles.",
+        "warning": "Performance depends on available system and graphics memory; this profile may be slow on lower-memory devices.",
     },
 }
 PROFILE_ALIASES = {

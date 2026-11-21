@@ -1,7 +1,7 @@
 import unittest
 
-from safeguards import authorize, Decision
-from brain import OrbitDeskBrain
+from orbitdesk.core.safeguards import authorize, Decision
+from orbitdesk.core.brain import OrbitDeskBrain
 
 
 class AuthorizationTests(unittest.TestCase):

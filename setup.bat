@@ -54,7 +54,7 @@ if errorlevel 1 (
 
 ".venv\Scripts\python.exe" -m pip install --upgrade pip
 if errorlevel 1 goto :error
-".venv\Scripts\python.exe" setup.py
+".venv\Scripts\python.exe" scripts\setup_app.py
 if errorlevel 1 goto :error
 exit /b 0
 

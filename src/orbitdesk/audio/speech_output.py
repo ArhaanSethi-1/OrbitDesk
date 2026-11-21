@@ -10,7 +10,8 @@ import edge_tts
 import pygame
 
 try:
-    for _line in Path(__file__).with_name(".env").read_text(encoding="utf-8").splitlines():
+    env_file = Path(__file__).resolve().parents[3] / ".env"
+    for _line in env_file.read_text(encoding="utf-8").splitlines():
         if _line.strip().startswith("JARVIS_VOICE="):
             os.environ.setdefault("JARVIS_VOICE", _line.split("=", 1)[1].strip().strip("\"'"))
 except OSError:

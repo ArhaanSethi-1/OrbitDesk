@@ -6,6 +6,7 @@ Thread-safe: call orb.request_state("Thinking") from any thread.
 
 import json
 import math
+import os
 import random
 import sys
 from pathlib import Path
@@ -17,15 +18,12 @@ from PySide6.QtGui import (
 )
 from PySide6.QtWidgets import QApplication, QLabel, QMenu, QWidget
 
-
-# ---------- SETTINGS ----------
-
 ORB_SIZE = 168
 FRAME_MS = 50                     # 20 fps while the orb is visible
 EDGE_MARGIN = 40                  # distance from the screen's right edge
 BOTTOM_MARGIN = 60                # distance above the bottom of the work area
 DEFAULT_ANCHOR = "bottom_right"   # or "bottom_centre"
-POSITION_FILE = Path(__file__).resolve().parent / "orb_settings.json"
+POSITION_FILE = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "OrbitDesk" / "orb_settings.json"
 
 STATE_MOTION = {"Idle": 1.0, "Listening": 1.10, "Thinking": 1.04, "Speaking": 1.20}
 STATE_SPIN = {"Idle": 0.55, "Listening": 2.0, "Thinking": 3.8, "Speaking": 1.25}
@@ -127,8 +125,6 @@ class OrbitDeskOrb(QWidget):
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.animate)
 
-    # ---------- PUBLIC API ----------
-
     def request_state(self, state):
         """Thread-safe. Call this from OrbitDesk's worker or timer threads."""
         self.state_requested.emit(state)
@@ -180,8 +176,6 @@ class OrbitDeskOrb(QWidget):
             max(0, self.y() - self.bubble.height() - 10),
         )
 
-    # ---------- GRADIENTS ----------
-
     def _build_glow(self):
         glow = QRadialGradient(self.cx, self.cy, 78)
         glow.setColorAt(0.0, QColor(0, 180, 255, 34))
@@ -200,8 +194,6 @@ class OrbitDeskOrb(QWidget):
         gradient.setColorAt(0.85, QColor(0, 225, 255, 230))
         gradient.setColorAt(1.0, QColor(0, 225, 255, 0))
         return gradient
-
-    # ---------- ANIMATION ----------
 
     def animate(self):
         if not self.isVisible():
@@ -291,8 +283,6 @@ class OrbitDeskOrb(QWidget):
         )
         p.end()
 
-    # ---------- POSITION ----------
-
     def _work_area(self, point=None):
         screen = None
         if point is not None:
@@ -346,8 +336,6 @@ class OrbitDeskOrb(QWidget):
         self.anchor = anchor
         self.reset_position()
 
-    # ---------- MOUSE ----------
-
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
             press_global = event.globalPosition().toPoint()
@@ -365,8 +353,6 @@ class OrbitDeskOrb(QWidget):
         if self.drag_offset is not None:
             self.drag_offset = None
             self._save_settings()
-
-    # ---------- MENU ----------
 
     def show_menu(self, position):
         menu = QMenu(self)

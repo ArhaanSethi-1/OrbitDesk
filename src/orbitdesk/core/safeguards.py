@@ -1,16 +1,4 @@
-"""
-OrbitDesk SAFEGUARDS
-
-Central policy for actions OrbitDesk may perform.
-
-Important:
-    This module must be called by brain.py before an action happens.
-    It does not independently sandbox Python or Windows.
-
-Every action name that brain.py passes to authorize() MUST appear in one of the
-sets below. Unknown names are blocked by default, so a missing entry silently
-disables the feature. test_safeguards.py checks this automatically.
-"""
+"""Security policy definitions and action authorization guards."""
 
 from pathlib import Path
 from enum import Enum
@@ -19,24 +7,18 @@ import json
 import os
 import threading
 
+PROJECT_DIR = Path(__file__).resolve().parents[3]
 
-# ---------- CONFIGURATION ----------
-
-PROJECT_DIR = Path(__file__).resolve().parent
-
-# OrbitDesk may read files only inside these directories
-# when code explicitly uses the file-access checks below.
+# Allowed paths for local file operations
 READABLE_DIRS = [
     PROJECT_DIR,
 ]
 
-# These folders may be used for new, non-sensitive output files.
 WRITABLE_DIRS = [
     PROJECT_DIR / "output",
 ]
 
-# These actions are permitted without asking each time.
-# Opening actions validate their targets against the explicit whitelists below.
+# Safe read-only and local operations allowed without prompting
 ALWAYS_ALLOWED = {
     "answer_question",
     "tell_time",
@@ -54,7 +36,7 @@ ALWAYS_ALLOWED = {
     "search_youtube",
 }
 
-# These actions require explicit approval from the user.
+# Operations that require explicit confirmation
 REQUIRES_APPROVAL = {
     "read_file",
     "create_file",
@@ -89,7 +71,7 @@ def _grant_key(action, target=None):
 
 
 def grant_always(action, target=None):
-    """Persist a user's Always Allow choice for a supported permission action."""
+    """Persist an 'Always Allow' choice for an approved action."""
     action = str(action).strip().lower()
     if action not in REQUIRES_APPROVAL:
         return False
@@ -105,7 +87,7 @@ def grant_always(action, target=None):
         except OSError:
             return False
 
-# These actions are blocked regardless of AI suggestions.
+# Restricted operations blocked unconditionally
 ALWAYS_BLOCKED = {
     "delete_file",
     "execute_arbitrary_command",
@@ -130,7 +112,7 @@ APPROVED_FOLDERS = {
 APPROVED_WEBSITE_HOSTS = {
     "youtube.com", "www.youtube.com", "google.com", "www.google.com",
     "mail.google.com", "reddit.com", "www.reddit.com", "github.com",
-    "chatgpt.com", "claude.ai", "antigravity.google", "www.wikipedia.org", "en.wikipedia.org", "open.spotify.com",
+    "chatgpt.com", "claude.ai", "www.wikipedia.org", "en.wikipedia.org", "open.spotify.com",
     "www.netflix.com", "www.instagram.com", "discord.com", "web.whatsapp.com",
     "www.amazon.com", "drive.google.com", "maps.google.com", "stackoverflow.com",
     "www.twitch.tv",
@@ -260,7 +242,7 @@ def authorize(action, target=None, approved=False):
         )
 
     else:
-        # Unknown actions must never be allowed by default.
+        # Fallback deny for unregistered actions
         return (
             Decision.BLOCK,
             f"Unknown action blocked by default: {action}"

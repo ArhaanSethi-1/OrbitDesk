@@ -55,11 +55,11 @@ from PySide6.QtWidgets import (
     QVBoxLayout, QWidget,
 )
 
-from brain import OrbitDeskBrain
-import automation
-from orb import OrbitDeskOrb
-from speech_output import VOICE, is_speaking, speak, stop_speaking
-import model_manager
+from orbitdesk.core.brain import OrbitDeskBrain
+from orbitdesk.core import automation
+from orbitdesk.ui.orb import OrbitDeskOrb
+from orbitdesk.audio.speech_output import VOICE, is_speaking, speak, stop_speaking
+from orbitdesk.models import model_manager
 
 APP_STYLE = """
 QMainWindow, QWidget { background: #0a0d14; color: #eaf2ff; font-family: 'Segoe UI'; }
@@ -524,7 +524,7 @@ class OrbitDeskWindow(QMainWindow):
 
     def _wake_loop(self):
         try:
-            import speech
+            from orbitdesk.audio import speech
             self.speech_module = speech
             while not self.closing and not self.wake_stop.is_set():
                 command = speech.listen_for_wake_command(

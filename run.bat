@@ -15,8 +15,8 @@ if not exist ".venv\Scripts\python.exe" (
     exit /b 1
 )
 
-if not exist "main.py" (
-    echo ERROR: main.py was not found.
+if not exist "src\orbitdesk\ui\dashboard.py" (
+    echo ERROR: OrbitDesk dashboard package was not found.
     pause
     exit /b 1
 )
@@ -79,11 +79,11 @@ echo Diagnostics are written to %LOCALAPPDATA%\OrbitDesk\logs\orbitdesk.log.
 echo.
 
 if exist ".venv\Scripts\pythonw.exe" (
-    start "" ".venv\Scripts\pythonw.exe" main.py
+    start "" ".venv\Scripts\pythonw.exe" -m orbitdesk.ui.dashboard
     exit /b 0
 )
 
-".venv\Scripts\python.exe" main.py
+".venv\Scripts\python.exe" -m orbitdesk.ui.dashboard
 set "EXIT_CODE=%errorlevel%"
 
 if not "%EXIT_CODE%"=="0" (

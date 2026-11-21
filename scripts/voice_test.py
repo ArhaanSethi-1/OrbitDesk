@@ -1,6 +1,6 @@
 """Quick in-memory voice output check."""
 
-from speech_output import speak
+from orbitdesk.audio.speech_output import speak
 
 
 if __name__ == "__main__":

@@ -11,11 +11,36 @@ import urllib.request
 import webbrowser
 from pathlib import Path
 
-AI_TARGETS = {
+DEFAULT_AI_TARGETS = {
     "chatgpt": ("ChatGPT", "https://chatgpt.com/"),
     "claude": ("Claude", "https://claude.ai/"),
-    "antigravity": ("Antigravity", "https://antigravity.google/"),
 }
+
+PROJECT_DIR = Path(__file__).resolve().parents[3]
+USER_CONFIG_DIR = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "OrbitDesk"
+
+
+def load_ai_targets():
+    """Return built-in AI sites extended by valid user-local entries."""
+    targets = dict(DEFAULT_AI_TARGETS)
+    try:
+        configured = json.loads((USER_CONFIG_DIR / "ai_targets.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return targets
+    if not isinstance(configured, dict):
+        return targets
+    for key, value in configured.items():
+        if not isinstance(value, dict):
+            continue
+        title, url = value.get("name"), value.get("url")
+        try:
+            parsed = urllib.parse.urlparse(str(url))
+        except ValueError:
+            continue
+        if (isinstance(title, str) and title.strip() and parsed.scheme == "https"
+                and parsed.hostname and not parsed.username and not parsed.password):
+            targets[str(key).casefold()] = (title.strip()[:60], url)
+    return targets
 
 
 class AutomationError(RuntimeError):
@@ -63,7 +88,7 @@ def run_approved_command(command):
         raise AutomationError(f"{executable} is not available on PATH.")
     try:
         result = subprocess.run(
-            [command_path, *args], cwd=Path(__file__).resolve().parent,
+            [command_path, *args], cwd=PROJECT_DIR,
             capture_output=True, text=True, timeout=15, shell=False,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
@@ -118,7 +143,7 @@ def _find_window(title_fragment):
 
 def _load_env():
     """Load simple KEY=value entries without overriding process environment."""
-    env_file = Path(__file__).with_name(".env")
+    env_file = PROJECT_DIR / ".env"
     try:
         for line in env_file.read_text(encoding="utf-8").splitlines():
             line = line.strip()
@@ -150,20 +175,6 @@ def _api_fallback(target, prompt):
             with urllib.request.urlopen(request, timeout=60) as response:
                 content = json.loads(response.read()).get("content", [])
                 return "\n".join(part.get("text", "") for part in content)
-        if target == "antigravity" and os.environ.get("GEMINI_API_KEY"):
-            endpoint = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent"
-            body = {"contents": [{"parts": [{"text": prompt}]}]}
-            request = urllib.request.Request(
-                endpoint,
-                data=json.dumps(body).encode(),
-                headers={
-                    "Content-Type": "application/json",
-                    "x-goog-api-key": os.environ["GEMINI_API_KEY"],
-                },
-            )
-            with urllib.request.urlopen(request, timeout=60) as response:
-                parts = json.loads(response.read()).get("candidates", [{}])[0].get("content", {}).get("parts", [])
-                return "\n".join(part.get("text", "") for part in parts)
     except Exception as error:
         # Avoid echoing request details in UI/log output; authentication headers and
         # provider responses can contain sensitive information.
@@ -174,7 +185,7 @@ def _api_fallback(target, prompt):
 
 def cloud_mode_enabled():
     try:
-        config = json.loads(Path(__file__).with_name(".orbitdesk_setup.json").read_text(encoding="utf-8"))
+        config = json.loads((PROJECT_DIR / ".orbitdesk_setup.json").read_text(encoding="utf-8"))
         return config.get("mode") == "lightweight"
     except (OSError, ValueError, TypeError):
         return os.environ.get("JARVIS_CLOUD_MODE", "").casefold() in {"1", "true", "yes"}
@@ -182,7 +193,7 @@ def cloud_mode_enabled():
 
 def ask_cloud(prompt):
     _load_env()
-    for target, key in (("chatgpt", "OPENAI_API_KEY"), ("claude", "ANTHROPIC_API_KEY"), ("antigravity", "GEMINI_API_KEY")):
+    for target, key in (("chatgpt", "OPENAI_API_KEY"), ("claude", "ANTHROPIC_API_KEY")):
         if os.environ.get(key):
             return _api_fallback(target, prompt)
     return None
@@ -190,9 +201,10 @@ def ask_cloud(prompt):
 
 def prompt_ai(target, prompt):
     """Focus a running AI window, or open its site and stage the prompt."""
-    if target not in AI_TARGETS:
+    ai_targets = load_ai_targets()
+    if target not in ai_targets:
         raise AutomationError("That AI target is not supported.")
-    title, url = AI_TARGETS[target]
+    title, url = ai_targets[target]
     window = _find_window(title)
     if window is None:
         webbrowser.open(url)
