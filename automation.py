@@ -151,15 +151,24 @@ def _api_fallback(target, prompt):
                 content = json.loads(response.read()).get("content", [])
                 return "\n".join(part.get("text", "") for part in content)
         if target == "antigravity" and os.environ.get("GEMINI_API_KEY"):
-            key = urllib.parse.quote(os.environ["GEMINI_API_KEY"])
-            endpoint = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={key}"
+            endpoint = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent"
             body = {"contents": [{"parts": [{"text": prompt}]}]}
-            request = urllib.request.Request(endpoint, data=json.dumps(body).encode(), headers={"Content-Type": "application/json"})
+            request = urllib.request.Request(
+                endpoint,
+                data=json.dumps(body).encode(),
+                headers={
+                    "Content-Type": "application/json",
+                    "x-goog-api-key": os.environ["GEMINI_API_KEY"],
+                },
+            )
             with urllib.request.urlopen(request, timeout=60) as response:
                 parts = json.loads(response.read()).get("candidates", [{}])[0].get("content", {}).get("parts", [])
                 return "\n".join(part.get("text", "") for part in parts)
     except Exception as error:
-        raise AutomationError(f"Configured {target} API request failed: {error}") from error
+        # Avoid echoing request details in UI/log output; authentication headers and
+        # provider responses can contain sensitive information.
+        detail = f"HTTP {error.code}" if isinstance(error, urllib.error.HTTPError) else "network or response error"
+        raise AutomationError(f"Configured {target} API request failed ({detail}).") from None
     return None
 
 

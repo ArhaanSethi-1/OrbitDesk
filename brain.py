@@ -27,6 +27,7 @@ from pathlib import Path
 from safeguards import authorize, Decision
 import automation
 import safeguards
+import model_manager
 
 try:
     import psutil
@@ -39,7 +40,7 @@ except ImportError:
 PROJECT_DIR = Path(__file__).resolve().parent
 
 OLLAMA_URL = "http://127.0.0.1:11434"
-MODEL = "qwen2.5:3b"
+MODEL = model_manager.PROFILES[model_manager.load_profile()]["model"]
 KEEP_ALIVE = "15m"        # keep Qwen loaded in memory between questions
 MAX_REPLY_TOKENS = 400    # shorter replies come back faster
 HISTORY_TURNS = 8         # question/answer pairs remembered
@@ -339,6 +340,14 @@ class LocalAI:
         self._lock = threading.Lock()
         self._history = deque(maxlen=HISTORY_TURNS * 2)
 
+    def set_model(self, model):
+        if model not in {entry["model"] for entry in model_manager.PROFILES.values()}:
+            raise ValueError("That model is not in OrbitDesk's approved model list.")
+        with self._lock:
+            self.model = model
+            self._history.clear()
+        return model
+
     def _post(self, path, payload, timeout):
         request = urllib.request.Request(
             self.base_url + path,
@@ -352,7 +361,9 @@ class LocalAI:
     def warm_up(self):
         """Load the model into memory in the background so the first reply is quicker."""
         try:
-            self._post("/api/generate", {"model": self.model, "keep_alive": KEEP_ALIVE}, timeout=300)
+            with self._lock:
+                model = self.model
+            self._post("/api/generate", {"model": model, "keep_alive": KEEP_ALIVE}, timeout=300)
         except Exception:
             pass  # OrbitDesk still works; the first reply will just take longer.
 
@@ -364,6 +375,7 @@ class LocalAI:
         # The lock is held only while reading or writing history, never during the HTTP call.
         with self._lock:
             history = list(self._history)
+            model = self.model
 
         # The model has no clock, so tell it the date and time on every request.
         now = datetime.datetime.now().strftime("%A %d %B %Y, %I:%M %p")
@@ -374,7 +386,7 @@ class LocalAI:
         messages.append({"role": "user", "content": text})
 
         payload = {
-            "model": self.model,
+            "model": model,
             "messages": messages,
             "stream": False,
             "keep_alive": KEEP_ALIVE,
@@ -393,8 +405,8 @@ class LocalAI:
                 if cloud:
                     return cloud
                 return (
-                    f"The model {self.model} isn't installed yet, sir. "
-                    f"Run: ollama pull {self.model}"
+                    f"The model {model} isn't installed yet, sir. "
+                    f"Run: ollama pull {model}"
                 )
             return f"My local AI returned error {error.code}, sir."
         except urllib.error.URLError as error:
@@ -421,8 +433,9 @@ class LocalAI:
 
         if remember:
             with self._lock:
-                self._history.append({"role": "user", "content": text})
-                self._history.append({"role": "assistant", "content": answer})
+                if self.model == model:
+                    self._history.append({"role": "user", "content": text})
+                    self._history.append({"role": "assistant", "content": answer})
 
         return answer
 
@@ -447,6 +460,7 @@ class OrbitDeskBrain:
         self.running = True
         self.notify = self._print_notification  # the GUI replaces this
         self.permission_request = permission_request
+        self.model_profile_request = None
         self.audit_callback = None
         self.ai = LocalAI()
 
@@ -465,6 +479,8 @@ class OrbitDeskBrain:
             (r"^(?:what(?:'s| is) (?:the |today'?s )?date(?: today)?|(?:today'?s )?date"
              r"|what day is it(?: today)?|what is today)$", self._date),
             (r"^(help|what can you do|show commands|list commands)$", self._help),
+            (r"^(?:switch|change|use|select)(?:\s+to)?(?:\s+the)?\s+(?P<profile>fast|faster|light|lightweight|low|coding|code|strong|high|higher|quality)(?:\s+(?:ai\s+)?(?:assistance|model|profile))?$", self._switch_model),
+            (r"^(?:switch|change|use|select)(?:\s+to)?(?:\s+the)?\s+(?P<profile>fast|faster|light|lightweight|low|coding|code|strong|high|higher|quality)(?:\s+(?:ai\s+)?(?:assistance|model|profile))?$", self._switch_model),
             (r"^(system (?:status|info)|battery|cpu|ram|memory usage|how is my (?:pc|laptop|computer))$",
              self._system_status),
             (r"^(?:calculate|calc|compute)\s+(?P<expression>.+)$", self._calculate),
@@ -515,7 +531,7 @@ class OrbitDeskBrain:
         ])
 
         # Load Qwen in the background so the first real question is faster.
-        if warm_up:
+        if warm_up and model_manager.load_profile() != "strong":
             threading.Thread(target=self.ai.warm_up, daemon=True).start()
 
     @staticmethod
@@ -709,6 +725,18 @@ class OrbitDeskBrain:
     def _reset(self, _match):
         self.ai.clear()
         return "Conversation cleared, sir."
+
+    def _switch_model(self, match):
+        profile = model_manager.PROFILE_ALIASES.get(match.group("profile").casefold())
+        if profile is None:
+            return "Choose fast, coding, or strong model, sir."
+        if self.model_profile_request is None:
+            return "Model switching is available from the dashboard settings, sir."
+        self.model_profile_request(profile)
+        warning = model_manager.PROFILES[profile]["warning"]
+        if warning:
+            return f"I’ll download the {model_manager.PROFILES[profile]['name']} model. {warning}"
+        return f"I’ll download and switch to the {model_manager.PROFILES[profile]['name']} model, sir."
 
     # ---------- SYSTEM ----------
 

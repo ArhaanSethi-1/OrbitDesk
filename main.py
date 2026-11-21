@@ -47,11 +47,11 @@ def _uncaught_thread(args):
 sys.excepthook = _uncaught_exception
 threading.excepthook = _uncaught_thread
 
-from PySide6.QtCore import QObject, Qt, QTimer, Signal
+from PySide6.QtCore import QObject, Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QColor, QIcon, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
-    QApplication, QDialog, QHBoxLayout, QLabel, QLineEdit, QListWidget,
-    QMainWindow, QPushButton, QSystemTrayIcon, QTabWidget, QTextBrowser,
+    QApplication, QComboBox, QDialog, QHBoxLayout, QLabel, QLineEdit, QListWidget,
+    QMainWindow, QProgressBar, QPushButton, QSystemTrayIcon, QTabWidget, QTextBrowser,
     QVBoxLayout, QWidget,
 )
 
@@ -59,6 +59,7 @@ from brain import OrbitDeskBrain
 import automation
 from orb import OrbitDeskOrb
 from speech_output import VOICE, is_speaking, speak, stop_speaking
+import model_manager
 
 APP_STYLE = """
 QMainWindow, QWidget { background: #0a0d14; color: #eaf2ff; font-family: 'Segoe UI'; }
@@ -144,6 +145,30 @@ class PermissionDialog(QDialog):
         event.accept()
 
 
+class ModelPullWorker(QThread):
+    progress = Signal(str, int)
+    completed = Signal(str)
+    failed = Signal(str)
+
+    def __init__(self, profile, parent=None):
+        super().__init__(parent)
+        self.profile = profile
+        self.model = model_manager.PROFILES[profile]["model"]
+
+    def run(self):
+        try:
+            model_manager.pull_model(
+                self.model,
+                lambda status: self.progress.emit(
+                    model_manager.progress_text(status), model_manager.progress_percent(status)
+                ),
+            )
+        except Exception as error:
+            self.failed.emit(str(error))
+            return
+        self.completed.emit(self.profile)
+
+
 class Waveform(QWidget):
     def __init__(self):
         super().__init__()
@@ -206,6 +231,7 @@ class OrbitDeskWindow(QMainWindow):
     permission_announcement = Signal(str)
     permission_resolved = Signal()
     shutdown_requested = Signal()
+    model_profile_requested = Signal(str)
 
     def __init__(self, app):
         super().__init__()
@@ -217,6 +243,7 @@ class OrbitDeskWindow(QMainWindow):
         self.command_lock = threading.Lock()
         self.permission_bridge = PermissionBridge()
         self.brain = OrbitDeskBrain(permission_request=self.permission_bridge.ask)
+        self.brain.model_profile_request = self.model_profile_requested.emit
         self.brain.audit_callback = lambda action, result: self.permission_bridge.audit.emit(action, result)
         self.brain.notify = lambda message: self.message_added.emit("OrbitDesk", message)
         self.speech_module = None
@@ -232,6 +259,8 @@ class OrbitDeskWindow(QMainWindow):
         self.shutdown_requested.connect(self.exit_app)
         self.permission_bridge.requested.connect(self._show_permission)
         self.permission_bridge.audit.connect(self._audit_permission)
+        self.model_profile_requested.connect(self._request_model_profile)
+        self.model_worker = None
 
         self.setWindowTitle("OrbitDesk | Jarvis Assistant")
         self.setMinimumSize(850, 610)
@@ -263,10 +292,8 @@ class OrbitDeskWindow(QMainWindow):
         title.setStyleSheet("font-size:22px;font-weight:700;color:#00e5ff;letter-spacing:2px")
         header.addWidget(title)
         header.addStretch()
-        self.model_label = QLabel(
-            "● CLOUD API FALLBACK · Optional .env keys" if automation.cloud_mode_enabled()
-            else "● LOCAL MODEL · QWEN 2.5:3B"
-        )
+        self.model_label = QLabel()
+        self._update_model_label()
         self.model_label.setStyleSheet("color:#63b6ff")
         header.addWidget(self.model_label)
         root.addLayout(header)
@@ -312,11 +339,32 @@ class OrbitDeskWindow(QMainWindow):
 
         settings_tab = QWidget()
         settings_layout = QVBoxLayout(settings_tab)
+        settings_layout.addWidget(QLabel("AI assistance model"))
+        self.model_selector = QComboBox()
+        for profile_id, profile in model_manager.PROFILES.items():
+            self.model_selector.addItem(f"{profile['name']} · {profile['model']}", profile_id)
+        self.model_selector.setCurrentIndex(max(0, self.model_selector.findData(model_manager.load_profile())))
+        self.model_selector.currentIndexChanged.connect(self._update_model_description)
+        settings_layout.addWidget(self.model_selector)
+        self.model_description = QLabel()
+        self.model_description.setWordWrap(True)
+        settings_layout.addWidget(self.model_description)
+        self.model_switch_button = QPushButton("Download and switch model")
+        self.model_switch_button.clicked.connect(lambda: self._request_model_profile(self.model_selector.currentData()))
+        settings_layout.addWidget(self.model_switch_button)
+        self.model_progress = QProgressBar()
+        self.model_progress.setRange(0, 100)
+        self.model_progress.setValue(0)
+        settings_layout.addWidget(self.model_progress)
+        self.model_status = QLabel("Model downloads start only when you request a profile.")
+        self.model_status.setWordWrap(True)
+        settings_layout.addWidget(self.model_status)
         settings_layout.addWidget(QLabel(f"Voice: {VOICE}  ·  Wake phrase: Hey Jarvis (optional single-word Jarvis model supported)"))
         settings_layout.addWidget(QLabel("Local transcription: faster-whisper base.en, CPU int8"))
         settings_layout.addWidget(QLabel("Close behaviour: minimize to system tray"))
         settings_layout.addStretch()
         self.tabs.addTab(settings_tab, "Settings")
+        self._update_model_description()
         root.addWidget(self.tabs, 1)
         self.setCentralWidget(center)
 
@@ -350,6 +398,80 @@ class OrbitDeskWindow(QMainWindow):
         if text.casefold().startswith("listening") and (self.busy or is_speaking()):
             return
         self.status_label.setText("● " + text.upper())
+
+    def _update_model_label(self):
+        profile_id = model_manager.load_profile()
+        profile = model_manager.PROFILES[profile_id]
+        prefix = "CLOUD FALLBACK · " if automation.cloud_mode_enabled() else "LOCAL MODEL · "
+        self.model_label.setText(f"● {prefix}{profile['model'].upper()}")
+
+    def _update_model_description(self, *_args):
+        if not hasattr(self, "model_selector"):
+            return
+        profile_id = self.model_selector.currentData()
+        profile = model_manager.PROFILES.get(profile_id, model_manager.PROFILES["fast"])
+        description = profile["description"]
+        if profile["warning"]:
+            description += "  " + profile["warning"]
+        self.model_description.setText(description)
+        self.model_description.setStyleSheet("color:#ffbd69" if profile["warning"] else "color:#a9bdd2")
+
+    def _request_model_profile(self, profile_id):
+        if self.closing:
+            return
+        try:
+            profile_id = model_manager.normalize_profile(profile_id)
+        except ValueError as error:
+            self.model_status.setText(str(error))
+            return
+        if self.model_worker is not None and self.model_worker.isRunning():
+            self.model_status.setText("A model download is already in progress.")
+            return
+        profile = model_manager.PROFILES[profile_id]
+        self.model_selector.setCurrentIndex(max(0, self.model_selector.findData(profile_id)))
+        self.model_progress.setValue(0)
+        self.model_status.setText("Preparing download… " + profile["warning"])
+        self.model_switch_button.setEnabled(False)
+        worker = ModelPullWorker(profile_id, self)
+        self.model_worker = worker
+        worker.progress.connect(self._model_pull_progress)
+        worker.completed.connect(self._model_pull_completed)
+        worker.failed.connect(self._model_pull_failed)
+        worker.finished.connect(lambda w=worker: self._model_worker_finished(w))
+        worker.start()
+
+    def _model_pull_progress(self, message, percent):
+        self.model_status.setText(message)
+        if percent >= 0:
+            self.model_progress.setRange(0, 100)
+            self.model_progress.setValue(percent)
+        else:
+            self.model_progress.setRange(0, 0)
+
+    def _model_pull_completed(self, profile_id):
+        profile = model_manager.PROFILES[profile_id]
+        try:
+            model_manager.save_profile(profile_id)
+            self.brain.ai.set_model(profile["model"])
+        except (OSError, ValueError) as error:
+            self.model_status.setText(f"Downloaded, but I couldn't save the selection: {error}")
+            return
+        self.model_progress.setRange(0, 100)
+        self.model_progress.setValue(100)
+        self.model_status.setText(f"Ready: {profile['name']}. The model will load when needed.")
+        self._update_model_label()
+        self._audit_permission("AI model", f"Switched to {profile['model']}")
+
+    def _model_pull_failed(self, message):
+        self.model_progress.setRange(0, 100)
+        self.model_progress.setValue(0)
+        self.model_status.setText(f"Model setup failed: {message}")
+
+    def _model_worker_finished(self, worker):
+        self.model_switch_button.setEnabled(True)
+        if self.model_worker is worker:
+            self.model_worker = None
+        worker.deleteLater()
 
     def _set_wake_active(self, active):
         self.waveform.set_active(active)

@@ -24,6 +24,12 @@ Run `setup.bat`. Select one of the setup choices:
 
 Python 3.10, 3.11, or 3.12 is supported. Once setup completes, run `run.bat`. The application starts minimized to the tray; say “Hey Jarvis” to activate an interaction, or open the dashboard from the tray.
 
+### Switching local models
+
+Open **Settings → AI assistance model**, choose a profile, then select **Download and switch model**. The model is pulled from the already-installed local Ollama service and the choice is saved under `%LOCALAPPDATA%\OrbitDesk\settings.json`. You can also say “Hey Jarvis, switch to coding model”, “switch to fast model”, or “switch to strong model”. Voice requests start the download automatically. OrbitDesk does not install Ollama itself.
+
+The profiles are Fast (`qwen2.5:3b`), Coding (`qwen2.5-coder:3b`), and Higher quality (`qwen2.5-coder:7b`). The 7B profile may be slow or memory constrained on an 8 GB RAM / 4 GB VRAM PC. It is downloaded only when selected.
+
 ## Optional API keys
 
 Create a local `.env` file in the project directory. Do not commit it:
